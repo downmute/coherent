@@ -16,20 +16,20 @@ const WHISPER_TAG = 'resolve/v0.6.0';
 // Kokoro seems to use v0.7.0 in the library (NEXT_VERSION_TAG)
 const KOKORO_TAG = 'resolve/v0.7.0';
 
-export const QWEN_MODEL: ModelSpec = {
-    name: 'Qwen3-4B-instruct-8bit',
+export const PHI_MODEL: ModelSpec = {
+    name: 'Phi-4-Mini-Instruct',
     files: [
         {
-            url: 'https://huggingface.co/pytorch/Qwen3-4B-INT8-INT4/resolve/main/model.pte',
-            filename: 'Qwen3-4B-instruct-8bit.pte'
+            url: 'https://huggingface.co/pytorch/Phi-4-mini-instruct-parq-3w-4e-shared/resolve/main/phi4_model_3bit.pte',
+            filename: 'phi4_model_3bit.pte'
         },
         {
-            url: `${URL_PREFIX}-qwen-3/${QWEN_TAG}/tokenizer.json`,
-            filename: 'qwen-tokenizer.json'
+            url: 'https://huggingface.co/pytorch/Phi-4-mini-instruct-parq-3w-4e-shared/resolve/main/tokenizer.json',
+            filename: 'phi4-tokenizer.json'
         },
         {
-            url: `${URL_PREFIX}-qwen-3/${QWEN_TAG}/tokenizer_config.json`,
-            filename: 'qwen-tokenizer_config.json'
+            url: 'https://huggingface.co/pytorch/Phi-4-mini-instruct-parq-3w-4e-shared/resolve/main/tokenizer_config.json',
+            filename: 'phi4-tokenizer_config.json'
         },
         // Whisper Tokenizer (Shared/Used by Qwen flow in VoiceScreen)
         {
@@ -44,6 +44,65 @@ export const QWEN_MODEL: ModelSpec = {
         {
             url: `${URL_PREFIX}-whisper-tiny.en/${WHISPER_TAG}/xnnpack/whisper_tiny_en_decoder_xnnpack.pte`,
             filename: 'whisper_tiny_decoder.pte'
+        }
+    ]
+};
+
+// Llama 3.2 1B SpinQuant (User Requested)
+// hf.co/software-mansion/react-native-executorch-llama-3.2/tree/main/llama-3.2-1B/spinquant
+// Llama 3.2 1B SpinQuant (User Requested)
+// Model uses main branch (spinquant subdir), Tokenizers use v0.6.0 tag (root)
+const LLAMA_REPO_MAIN = 'https://huggingface.co/software-mansion/react-native-executorch-llama-3.2/resolve/main/';
+const LLAMA_REPO_V0_6_0 = 'https://huggingface.co/software-mansion/react-native-executorch-llama-3.2/resolve/v0.6.0/';
+const LLAMA_MODEL_DIR = 'llama-3.2-1B/spinquant/';
+
+export const LLAMA_1B_MODEL: ModelSpec = {
+    name: 'Llama-3.2-1B-SpinQuant',
+    files: [
+        {
+            url: `${LLAMA_REPO_MAIN}${LLAMA_MODEL_DIR}llama3_2_spinquant.pte`,
+            filename: 'llama-3.2-1b-spinquant.pte'
+        },
+        {
+            url: `${LLAMA_REPO_V0_6_0}tokenizer.json`,
+            filename: 'tokenizer.json'
+        },
+        {
+            url: `${LLAMA_REPO_V0_6_0}tokenizer_config.json`,
+            filename: 'tokenizer_config.json'
+        },
+        // Whisper Models (Still needed for STT)
+        {
+            url: `${URL_PREFIX}-whisper-tiny.en/${WHISPER_TAG}/tokenizer.json`,
+            filename: 'whisper-tokenizer.json'
+        },
+        {
+            url: `${URL_PREFIX}-whisper-tiny.en/${WHISPER_TAG}/xnnpack/whisper_tiny_en_encoder_xnnpack.pte`,
+            filename: 'whisper_tiny_encoder.pte'
+        },
+        {
+            url: `${URL_PREFIX}-whisper-tiny.en/${WHISPER_TAG}/xnnpack/whisper_tiny_en_decoder_xnnpack.pte`,
+            filename: 'whisper_tiny_decoder.pte'
+        }
+    ]
+};
+
+// Qwen 2.5 0.5B (Tiny!)
+const QWEN25_TAG = 'resolve/v0.6.0';
+export const QWEN_05B_MODEL: ModelSpec = {
+    name: 'Qwen-2.5-0.5B-Instruct',
+    files: [
+        {
+            url: `${URL_PREFIX}-qwen-2.5/${QWEN25_TAG}/qwen-2.5-0.5B/quantized/qwen2_5_0_5b_8da4w.pte`,
+            filename: 'qwen-2.5-0.5b-quantized.pte'
+        },
+        {
+            url: `${URL_PREFIX}-qwen-2.5/${QWEN25_TAG}/tokenizer.json`,
+            filename: 'qwen-tokenizer.json'
+        },
+        {
+            url: `${URL_PREFIX}-qwen-2.5/${QWEN25_TAG}/tokenizer_config.json`,
+            filename: 'qwen-tokenizer_config.json'
         }
     ]
 };
@@ -198,6 +257,15 @@ const downloadFileSafely = async (
             if (result && result.uri && await isValidFile(result.uri)) {
                 return result.uri;
             } else {
+                // Read and log the file content if it's small (to see if it's a 404 or git-lfs pointer)
+                if (result?.uri) {
+                    try {
+                        const content = await FileSystem.readAsStringAsync(result.uri);
+                        console.error(`[Download Fail] Content of ${filename} (${content.length} bytes): ${content.substring(0, 100)}`);
+                    } catch (readErr) {
+                        console.error(`[Download Fail] Could not read ${filename}`);
+                    }
+                }
                 throw new Error(`Download failed/invalid for ${filename}`);
             }
         } catch (e) {
@@ -275,7 +343,7 @@ export const downloadAllModels = async (
     onStatus?: (status: string) => void
 ) => {
     const allFiles = [
-        ...QWEN_MODEL.files.map(f => ({ ...f, model: QWEN_MODEL.name })),
+        ...LLAMA_1B_MODEL.files.map(f => ({ ...f, model: LLAMA_1B_MODEL.name })),
         ...KOKORO_MODEL.files.map(f => ({ ...f, model: KOKORO_MODEL.name }))
     ];
 
@@ -317,5 +385,44 @@ export const downloadAllModels = async (
 
         fileProgress[i] = 1; // Ensure complete
         updateAggregateProgress();
+    }
+};
+
+export const clearAllModels = async () => {
+    try {
+        const info = await FileSystem.getInfoAsync(MODELS_DIR);
+        if (info.exists) {
+            console.log('[ModelLoader] Deleting models directory...');
+            await FileSystem.deleteAsync(MODELS_DIR);
+
+            // Clear in-memory cache
+            for (const key in CACHED_PATHS) {
+                delete CACHED_PATHS[key];
+            }
+            console.log('[ModelLoader] Models deleted successfully.');
+        }
+    } catch (e) {
+        console.error('[ModelLoader] Error clearing models:', e);
+        throw e;
+    }
+};
+
+export const injectChatTemplate = async (configPath: string) => {
+    try {
+        const content = await FileSystem.readAsStringAsync(configPath);
+        const config = JSON.parse(content);
+
+        if (!config.chat_template) {
+            console.log('[ModelLoader] Injecting chat_template into tokenizer_config...');
+            // Standard Phi-3 / Phi-4 template
+            config.chat_template = "{{ bos_token }}{% for message in messages %}{{'<|' + message['role'] + '|>' + '\n' + message['content'] + '<|end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>' + '\n' }}{% else %}{{ eos_token }}{% endif %}";
+
+            await FileSystem.writeAsStringAsync(configPath, JSON.stringify(config, null, 2));
+            console.log('[ModelLoader] chat_template injected successfully.');
+        } else {
+            console.log('[ModelLoader] chat_template already exists.');
+        }
+    } catch (e) {
+        console.error('[ModelLoader] Error injecting chat_template:', e);
     }
 };

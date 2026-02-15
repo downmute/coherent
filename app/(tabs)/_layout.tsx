@@ -24,15 +24,7 @@ export default function TabLayout() {
                     ),
                 }}
             />
-            <Tabs.Screen
-                name="chat"
-                options={{
-                    title: "Live Chat",
-                    tabBarIcon: ({ color, size }) => (
-                        <Ionicons name="chatbubble-ellipses-outline" size={size} color={color} />
-                    ),
-                }}
-            />
+
             <Tabs.Screen
                 name="voice"
                 options={{

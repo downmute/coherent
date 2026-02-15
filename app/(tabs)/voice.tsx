@@ -2,7 +2,6 @@ import React, { useContext, useEffect, useRef, useState } from 'react';
 import {
     Animated,
     Dimensions,
-    Easing,
     Keyboard,
     Platform,
     StyleSheet,
@@ -26,7 +25,12 @@ import {
     useTextToSpeech,
     WHISPER_TINY_EN,
 } from 'react-native-executorch';
-import { ensureModelExists, KOKORO_MODEL, QWEN_MODEL } from '../../services/ModelLoader';
+import {
+    clearAllModels,
+    ensureModelExists,
+    KOKORO_MODEL,
+    LLAMA_1B_MODEL
+} from '../../services/ModelLoader';
 
 const { width } = Dimensions.get('window');
 
@@ -128,6 +132,8 @@ function VoiceChatScreen() {
 
     // Session State
     const [sessionActive, setSessionActive] = useState(false);
+    // Ref to track session state for async callbacks (like onended)
+    const sessionActiveRef = useRef(sessionActive);
     const [selectedScenario, setSelectedScenario] = useState<Scenario | null>(null);
     const [persona, setPersona] = useState<string>('');
     const [activeVoiceFile, setActiveVoiceFile] = useState<string>('kokoro-voice-af_heart.bin');
@@ -144,84 +150,64 @@ function VoiceChatScreen() {
     const sourceRef = useRef<AudioBufferSourceNode | null>(null);
     const lastSpokenResponse = useRef<string>('');
 
+    // VAD State
+    const silenceStartRef = useRef<number | null>(null);
+    const isSpeakingRef = useRef<boolean>(false);
+
     // Animation
     const pulseAnim = useRef(new Animated.Value(1)).current;
 
     // --- Effects ---
 
-    // 1. Load Models
+    // Sync sessionActive to ref
     useEffect(() => {
-        const loadModels = async () => {
-            try {
-                setDownloadStatus('Downloading Qwen3-4B...');
-                const qPaths = await ensureModelExists(QWEN_MODEL, (p) => setDownloadProgress(p));
-                setQwenPaths(qPaths);
+        sessionActiveRef.current = sessionActive;
+    }, [sessionActive]);
 
-                setDownloadStatus('Downloading Kokoro...');
-                const kPaths = await ensureModelExists(KOKORO_MODEL, (p) => setDownloadProgress(p));
-                setKokoroPaths(kPaths);
+    // 1. Load Models (Manual Trigger now)
 
-                setDownloadStatus('Ready');
-            } catch (e) {
-                console.error(e);
-                setDownloadStatus('Error downloading models: ' + e);
-            }
-        };
-        loadModels();
-    }, []);
+    // 1. Load Models (Manual Trigger now)
+    const handleLoadModels = async () => {
+        try {
+            setDownloadStatus('Downloading Llama 3.2 1B SpinQuant...');
+            // Using LLAMA_1B_MODEL instead of PHI_MODEL
+            const qPaths = await ensureModelExists(LLAMA_1B_MODEL, (p) => setDownloadProgress(p));
+            // Inject chat_template if missing (Llama usually has one, but safe to check/inject if we have a template logic)
+            // But Llama 3.2 likely works out of box or we rely on tokenizer_config.
+            // await injectChatTemplate(qPaths['llama-tokenizer_config.json']); 
+            setQwenPaths(qPaths);
 
-    // 2. Setup Audio Session
-    useEffect(() => {
-        AudioManager.setAudioSessionOptions({
-            iosCategory: 'playAndRecord',
-            iosMode: 'spokenAudio',
-            iosOptions: ['allowBluetooth', 'defaultToSpeaker'],
-        });
-        AudioManager.requestRecordingPermissions();
+            setDownloadStatus('Downloading Kokoro...');
+            const kPaths = await ensureModelExists(KOKORO_MODEL, (p) => setDownloadProgress(p));
+            setKokoroPaths(kPaths);
 
-        audioContextRef.current = new AudioContext({ sampleRate: 24000 });
-        audioContextRef.current.suspend();
-
-        return () => {
-            audioContextRef.current?.close();
-            audioContextRef.current = null;
-        };
-    }, []);
-
-    // 3. Animation Loop
-    useEffect(() => {
-        if (isPlaying || (sessionActive && llm.isGenerating)) {
-            Animated.loop(
-                Animated.sequence([
-                    Animated.timing(pulseAnim, {
-                        toValue: 1.2,
-                        duration: 1000,
-                        easing: Easing.inOut(Easing.ease),
-                        useNativeDriver: true,
-                    }),
-                    Animated.timing(pulseAnim, {
-                        toValue: 1,
-                        duration: 1000,
-                        easing: Easing.inOut(Easing.ease),
-                        useNativeDriver: true,
-                    }),
-                ])
-            ).start();
-        } else {
-            pulseAnim.stopAnimation();
-            Animated.spring(pulseAnim, {
-                toValue: 1,
-                useNativeDriver: true,
-            }).start();
+            setDownloadStatus('Ready');
+        } catch (e) {
+            console.error(e);
+            setDownloadStatus('Error downloading models: ' + e);
         }
-    }, [isPlaying, sessionActive]); // Check deps
+    };
 
-    // --- Hooks Configuration ---
+    const handleClearModels = async () => {
+        try {
+            await clearAllModels();
+            // Reset paths to null to trigger "Download" UI
+            setQwenPaths(null);
+            setKokoroPaths(null);
+            setDownloadStatus('Models cleared. Ready to download.');
+            setDownloadProgress(0);
+        } catch (e) {
+            console.error(e);
+            setDownloadStatus('Error clearing models: ' + e);
+        }
+    };
+
+    // ...
 
     const llmConfig = React.useMemo(() => qwenPaths ? {
-        modelSource: qwenPaths['Qwen3-4B-instruct-8bit.pte'],
-        tokenizerSource: qwenPaths['qwen-tokenizer.json'],
-        tokenizerConfigSource: qwenPaths['qwen-tokenizer_config.json'],
+        modelSource: qwenPaths['llama-3.2-1b-spinquant.pte'], // Updated filename
+        tokenizerSource: qwenPaths['tokenizer.json'],
+        tokenizerConfigSource: qwenPaths['tokenizer_config.json'],
     } : {
         modelSource: '',
         tokenizerSource: '',
@@ -246,7 +232,7 @@ function VoiceChatScreen() {
     });
 
     const ttsConfig = React.useMemo(() => kokoroPaths ? {
-        type: 'kokoro',
+        type: 'kokoro' as const,
         durationPredictorSource: kokoroPaths['kokoro-duration-predictor.pte'],
         synthesizerSource: kokoroPaths['kokoro-synthesizer.pte'],
     } : KOKORO_MEDIUM, [kokoroPaths]);
@@ -273,12 +259,48 @@ function VoiceChatScreen() {
         setGlobalGenerating(llm.isGenerating || speechToText.isGenerating || tts.isGenerating);
     }, [llm.isGenerating, speechToText.isGenerating, tts.isGenerating, setGlobalGenerating]);
 
+    // Audio Setup (Mount only)
+    useEffect(() => {
+        // Configure Audio Session for Play and Record
+        AudioManager.setAudioSessionOptions({
+            iosCategory: 'playAndRecord',
+            iosMode: 'spokenAudio',
+            iosOptions: ['allowBluetooth', 'defaultToSpeaker'],
+        });
+
+        // Initialize Audio Context for TTS (Kokoro uses 24000Hz)
+        audioContextRef.current = new AudioContext({ sampleRate: 24000 });
+        console.log('[Audio] Context initialized');
+
+        return () => {
+            audioContextRef.current?.close();
+            audioContextRef.current = null;
+        };
+    }, []);
+
     // Deferred session start: Send system prompt after TTS reconfigures
     useEffect(() => {
+
         if (pendingSystemPrompt && tts.isReady && llm.isReady) {
-            console.log("[Session] Sending system prompt...");
-            llm.sendMessage(pendingSystemPrompt).catch((e: any) => console.error("Failed to start session:", e));
+            console.log("[Session] Sending system prompt...", pendingSystemPrompt.substring(0, 50) + "...");
+            // Don't await this, let it run in background to avoid blocking UI
+            llm.sendMessage(pendingSystemPrompt)
+                .then(async (res) => {
+                    console.log("[Session] System prompt sent. Response:", res);
+                    // Kickstart the conversation with a hidden user message to force a greeting
+                    console.log("[Session] Sending trigger message...");
+                    try {
+                        await llm.sendMessage("Hello, I am ready to practice. Please introduce yourself.");
+                        console.log("[Session] Trigger message sent.");
+                    } catch (err) {
+                        console.error("[Session] Trigger message failed:", err);
+                    }
+                })
+                .catch((e: any) => console.error("[Session] Failed to start session:", e));
+
             setPendingSystemPrompt(null); // Clear once sent
+        } else if (pendingSystemPrompt) {
+            console.log("[Session] Waiting for models... TTS:", tts.isReady ? "Ready" : "Not Ready", "LLM:", llm.isReady ? "Ready" : "Not Ready");
         }
     }, [pendingSystemPrompt, tts.isReady, llm.isReady]);
 
@@ -288,7 +310,11 @@ function VoiceChatScreen() {
         if (!sessionActive) return;
 
         const generatedText = llm.response;
+        // Debug Log
+        // console.log(`[TTS Check] isGenerating: ${llm.isGenerating}, ready: ${tts.isReady}, textLen: ${generatedText?.length}, last: ${lastSpokenResponse.current?.length}`);
+
         if (!llm.isGenerating && generatedText && generatedText !== lastSpokenResponse.current && tts.isReady) {
+            console.log('[TTS] Triggering speech for:', generatedText.substring(0, 50) + '...');
             lastSpokenResponse.current = generatedText;
             handlePlayAudio(generatedText);
         }
@@ -351,7 +377,7 @@ function VoiceChatScreen() {
 
         const p = getRandomPersona(selectedScenario);
         const scenarioDef = SCENARIOS.find(s => s.id === selectedScenario);
-        const systemPrompt = `SYSTEM DIRECTIVE: ${scenarioDef?.promptBase} Your Persona: ${p.description} Keep responses concise and conversational.`;
+        const systemPrompt = `SYSTEM DIRECTIVE: ${scenarioDef?.promptBase} Your Persona: ${p.description} Keep responses concise and conversational. Start with a short greeting.`;
 
         setPersona(p.description);
         setActiveVoiceFile(p.voiceFile);
@@ -362,32 +388,145 @@ function VoiceChatScreen() {
     const handleRecordPress = async () => {
         if (!qwenPaths || !kokoroPaths) return;
 
+        // Check permissions first
+        console.log('[Permissions] Requesting microphone access...');
+        const perm = await AudioManager.requestRecordingPermissions();
+        console.log('[Permissions] Result:', JSON.stringify(perm));
+
+        // Check if granted (it might return 'granted' string or an object depending on version/platform)
+        if (perm !== 'granted' && (typeof perm === 'object' && perm['status'] !== 'granted')) {
+            alert('Microphone permission denied');
+            // console.log('Permission object:', perm);
+            return;
+        }
+
         if (isPlaying) {
             handleStop();
             return;
         }
 
         if (isRecording) {
+            console.log('[Recorder] Stopping manually...');
             setIsRecording(false);
             recorder.stop();
             recorder.clearOnAudioReady();
             speechToText.streamStop();
         } else {
+            console.log('[Recorder] Starting...');
             setIsRecording(true);
-            recorder.onAudioReady({
-                sampleRate: 16000,
-                bufferLength: 1600,
+            // Reset VAD state
+            silenceStartRef.current = null;
+            isSpeakingRef.current = false;
+
+            // Debug: Add Error Listener
+            recorder.onError((e) => {
+                console.error('[Recorder] onError event:', JSON.stringify(e));
+            });
+
+            // Activate Audio Session
+            try {
+                const active = await AudioManager.setAudioSessionActivity(true);
+                console.log('[Recorder] Audio Session Active:', active);
+            } catch (e) {
+                console.error('[Recorder] Failed to activate audio session:', e);
+            }
+
+            const sampleRate = 16000; // Hardcoded to 16k for STT
+            console.log('[Recorder] Using sample rate:', sampleRate);
+
+            const readyResult = recorder.onAudioReady({
+                sampleRate: sampleRate,
+                bufferLength: 1600, // 0.1 * 16000
                 channelCount: 1,
             }, ({ buffer }) => {
-                speechToText.streamInsert(buffer.getChannelData(0));
+                const data = buffer.getChannelData(0);
+                // console.log('[Recorder] Data received, length:', data.length); // Super verbose, uncomment if needed
+                speechToText.streamInsert(data);
+
+                // --- VAD Logic ---
+                // Calculate RMS
+                let sum = 0;
+                for (let i = 0; i < data.length; i++) {
+                    sum += data[i] * data[i];
+                }
+                const rms = Math.sqrt(sum / data.length);
+
+                // Thresholds
+                const SPEECH_THRESHOLD = 0.01; // Lowered threshold for better sensitivity
+                const SILENCE_DURATION_MS = 750; // 0.75 seconds of silence
+
+                // Throttle logging - REMOVED FOR DEBUGGING
+                // if (Math.random() < 0.05) {
+                console.log('[VAD] Current RMS:', rms.toFixed(4));
+                // }
+
+                if (rms > SPEECH_THRESHOLD) {
+                    if (!isSpeakingRef.current) {
+                        console.log('[VAD] Speech detected (RMS:', rms.toFixed(4), ')');
+                    }
+                    isSpeakingRef.current = true;
+                    silenceStartRef.current = null; // Reset silence timer
+                } else {
+                    // It's quiet
+                    if (isSpeakingRef.current) {
+                        // We were speaking, now we are silent. Start counting?
+                        if (silenceStartRef.current === null) {
+                            silenceStartRef.current = Date.now();
+                        } else {
+                            const diff = Date.now() - silenceStartRef.current;
+                            if (diff > SILENCE_DURATION_MS) {
+                                console.log('[VAD] Silence detected for', diff, 'ms. Stopping.');
+
+                                // FORCE STOP
+                                recorder.stop(); // Stop recording immediately
+                                recorder.clearOnAudioReady();
+                                setIsRecording(false);
+                                speechToText.streamStop(); // This resolves the main promise
+                                console.log('[VAD] Triggered streamStop()');
+                            }
+                        }
+                    }
+                }
             });
-            recorder.start();
+            console.log('[Recorder] onAudioReady setup result:', JSON.stringify(readyResult));
+
+            const startResult = recorder.start();
+            console.log('[Recorder] start result:', JSON.stringify(startResult));
+            // We removed the original "await speechToText.stream()" here because VAD handles the stop -> process flow.
+            // But if the user manually stops, we still need to process.
+            // We need to support BOTH manual stop and VAD stop.
+            // The logic above in "isRecording" block handles manual stop.
+            // But checking "await speechToText.stream()" in the start block blocks the UI thread if not careful,
+            // or rather, it waits for streamStop() to be called.
+            // So we can keep it for manual stop case? 
+            // Actually, if we use VAD, the VAD block calls standard logic.
+            // Let's refactor manual stop to invoke the same processing logic to avoid duplication?
+            // For now, let's just let the VAD block handle the "Auto Stop" case.
+            // And for Manual Stop, we need to ensure we capture the result.
+
+            // To support Manual Stop (clicking the button), we need to capture the promise there too?
+            // The previous code had:
+            // try { const transcription = await speechToText.stream(); ... }
+            // This waits until streamStop() is called.
+            // So we can keep that here!
             try {
-                const transcription = await speechToText.stream();
-                // Send to LLM
-                await llm.sendMessage(transcription);
+                if (!speechToText.isGenerating) {
+                    console.log('[STT Stream] Starting stream loop...');
+                    const transcription = await speechToText.stream();
+                    console.log('[STT Stream] Result:', transcription);
+
+                    if (transcription.trim().length > 0) {
+                        console.log('[LLM] Sending user message:', transcription);
+                        await llm.sendMessage(transcription);
+                        console.log('[LLM] User message sent.');
+                    } else {
+                        console.log('[STT Stream] Empty transcription.');
+                    }
+                } else {
+                    console.warn('[STT Stream] Already generating, skipping start.');
+                }
             } catch (e) {
-                console.error(e);
+                console.error('[STT Stream] Error:', e);
             }
         }
     };
@@ -396,14 +535,35 @@ function VoiceChatScreen() {
 
     if (!qwenPaths || !kokoroPaths || !llm.isReady || !speechToText.isReady || !tts.isReady) {
         return (
-            <Spinner
-                visible={true}
-                textContent={
-                    (!qwenPaths || !kokoroPaths)
-                        ? `${downloadStatus} ${(downloadProgress * 100).toFixed(0)}%`
-                        : `Loading...\nLLM: ${llm.isReady ? 'Ready' : 'Init'}\nSTT: ${speechToText.isReady ? 'Ready' : 'Init'}\nTTS: ${tts.isReady ? 'Ready' : 'Init'}`
-                }
-            />
+            <View style={styles.container}>
+                <View style={styles.orbContainer}>
+                    <Text style={[styles.headerTitle, { marginBottom: 20 }]}>AI Setup</Text>
+
+                    <Text style={{ textAlign: 'center', marginBottom: 20, paddingHorizontal: 40, color: '#666' }}>
+                        {downloadStatus}
+                    </Text>
+
+                    {downloadStatus.includes('Downloading') ? (
+                        <Spinner visible={true} textContent={`${(downloadProgress * 100).toFixed(0)}%`} />
+                    ) : (
+                        <>
+                            <TouchableOpacity
+                                style={[styles.startButton, { width: 200, marginBottom: 16 }]}
+                                onPress={handleLoadModels}
+                            >
+                                <Text style={styles.startText}>Load AI Models</Text>
+                            </TouchableOpacity>
+
+                            <TouchableOpacity
+                                style={[styles.endButtonUI, { padding: 10 }]}
+                                onPress={handleClearModels}
+                            >
+                                <Text style={{ color: 'red', fontWeight: '600', fontSize: 16 }}>Reset / Clear Cache</Text>
+                            </TouchableOpacity>
+                        </>
+                    )}
+                </View>
+            </View>
         );
     }
 
@@ -532,6 +692,10 @@ const styles = StyleSheet.create({
         color: '#FF3B30',
         fontSize: 16,
         fontWeight: '600',
+    },
+    endButtonUI: {
+        alignItems: 'center',
+        justifyContent: 'center',
     },
 
     // Selection Styles
