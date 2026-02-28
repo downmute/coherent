@@ -48,28 +48,23 @@ export const PHI_MODEL: ModelSpec = {
     ]
 };
 
-// Llama 3.2 1B SpinQuant (User Requested)
-// hf.co/software-mansion/react-native-executorch-llama-3.2/tree/main/llama-3.2-1B/spinquant
-// Llama 3.2 1B SpinQuant (User Requested)
-// Model uses main branch (spinquant subdir), Tokenizers use v0.6.0 tag (root)
-const LLAMA_REPO_MAIN = 'https://huggingface.co/software-mansion/react-native-executorch-llama-3.2/resolve/main/';
-const LLAMA_REPO_V0_6_0 = 'https://huggingface.co/software-mansion/react-native-executorch-llama-3.2/resolve/v0.6.0/';
-const LLAMA_MODEL_DIR = 'llama-3.2-1B/spinquant/';
+const LFM2_5_REPO_MAIN = 'https://huggingface.co/software-mansion/react-native-executorch-lfm2.5-1.2B-instruct/resolve/main/';
+const FSMN_VAD_REPO_MAIN = 'https://huggingface.co/software-mansion/react-native-executorch-fsmn-vad/resolve/main/';
 
-export const LLAMA_1B_MODEL: ModelSpec = {
-    name: 'Llama-3.2-1B-SpinQuant',
+export const LFM2_5_1_2B_INSTRUCT_MODEL: ModelSpec = {
+    name: 'LFM2.5-1.2B-Instruct-Quantized',
     files: [
         {
-            url: `${LLAMA_REPO_MAIN}${LLAMA_MODEL_DIR}llama3_2_spinquant.pte`,
-            filename: 'llama-3.2-1b-spinquant.pte'
+            url: `${LFM2_5_REPO_MAIN}lfm2_5_1_2b_8da4w.pte`,
+            filename: 'lfm2_5_1_2b_8da4w.pte'
         },
         {
-            url: `${LLAMA_REPO_V0_6_0}tokenizer.json`,
-            filename: 'tokenizer.json'
+            url: `${LFM2_5_REPO_MAIN}tokenizer.json`,
+            filename: 'lfm-tokenizer.json'
         },
         {
-            url: `${LLAMA_REPO_V0_6_0}tokenizer_config.json`,
-            filename: 'tokenizer_config.json'
+            url: `${LFM2_5_REPO_MAIN}tokenizer_config.json`,
+            filename: 'lfm-tokenizer_config.json'
         },
         // Whisper Models (Still needed for STT)
         {
@@ -83,7 +78,22 @@ export const LLAMA_1B_MODEL: ModelSpec = {
         {
             url: `${URL_PREFIX}-whisper-tiny.en/${WHISPER_TAG}/xnnpack/whisper_tiny_en_decoder_xnnpack.pte`,
             filename: 'whisper_tiny_decoder.pte'
+        },
+        // FSMN VAD (used for end-of-speech detection)
+        {
+            url: `${FSMN_VAD_REPO_MAIN}xnnpack/fsmn-vad_xnnpack.pte`,
+            filename: 'fsmn-vad_xnnpack.pte'
         }
+    ]
+};
+
+export const STT_VAD_MODEL: ModelSpec = {
+    name: 'STT-VAD',
+    files: [
+        { url: `${URL_PREFIX}-whisper-tiny.en/${WHISPER_TAG}/tokenizer.json`, filename: 'whisper-tokenizer.json' },
+        { url: `${URL_PREFIX}-whisper-tiny.en/${WHISPER_TAG}/xnnpack/whisper_tiny_en_encoder_xnnpack.pte`, filename: 'whisper_tiny_encoder.pte' },
+        { url: `${URL_PREFIX}-whisper-tiny.en/${WHISPER_TAG}/xnnpack/whisper_tiny_en_decoder_xnnpack.pte`, filename: 'whisper_tiny_decoder.pte' },
+        { url: `${FSMN_VAD_REPO_MAIN}xnnpack/fsmn-vad_xnnpack.pte`, filename: 'fsmn-vad_xnnpack.pte' },
     ]
 };
 
@@ -343,7 +353,7 @@ export const downloadAllModels = async (
     onStatus?: (status: string) => void
 ) => {
     const allFiles = [
-        ...LLAMA_1B_MODEL.files.map(f => ({ ...f, model: LLAMA_1B_MODEL.name })),
+        ...STT_VAD_MODEL.files.map(f => ({ ...f, model: STT_VAD_MODEL.name })),
         ...KOKORO_MODEL.files.map(f => ({ ...f, model: KOKORO_MODEL.name }))
     ];
 
