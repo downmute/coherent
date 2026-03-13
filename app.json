@@ -82,7 +82,8 @@
             "backgroundColor": "#000000"
           }
         }
-      ]
+      ],
+      "onnxruntime-react-native"
     ],
     "experiments": {
       "typedRoutes": true,

@@ -11,7 +11,7 @@ export function useGroqLLM() {
     const historyRef = useRef<ChatMessage[]>([]);
     const systemPromptRef = useRef('');
     const contextWindowLengthRef = useRef(8);
-    const abortControllerRef = useRef<AbortController | null>(null);
+    const xhrRef = useRef<XMLHttpRequest | null>(null);
     const promptTokensRef = useRef(0);
     const generatedTokensRef = useRef(0);
 
@@ -25,8 +25,8 @@ export function useGroqLLM() {
     }, []);
 
     const interrupt = useCallback(() => {
-        abortControllerRef.current?.abort();
-        abortControllerRef.current = null;
+        xhrRef.current?.abort();
+        xhrRef.current = null;
     }, []);
 
     const reload = useCallback(async () => {
@@ -39,8 +39,6 @@ export function useGroqLLM() {
         userText: string,
         opts?: { onToken?: (token: string) => void }
     ) => {
-        const controller = new AbortController();
-        abortControllerRef.current = controller;
         const onToken = opts?.onToken;
         const userMsg: ChatMessage = { role: 'user', content: userText };
         const windowSize = contextWindowLengthRef.current * 2;
@@ -55,49 +53,66 @@ export function useGroqLLM() {
         setIsGenerating(true);
         let assistantText = '';
         try {
-            const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-                body: JSON.stringify({
+            await new Promise<void>((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
+                xhrRef.current = xhr;
+                let lastIndex = 0;
+
+                const processChunk = (newText: string) => {
+                    const lines = newText.split('\n');
+                    for (const line of lines) {
+                        const trimmed = line.trim();
+                        if (!trimmed.startsWith('data: ')) continue;
+                        const data = trimmed.slice(6);
+                        if (data === '[DONE]') return;
+                        try {
+                            const content = JSON.parse(data)?.choices?.[0]?.delta?.content;
+                            if (content) { assistantText += content; generatedTokensRef.current++; onToken?.(content); }
+                        } catch {}
+                    }
+                };
+
+                xhr.onreadystatechange = () => {
+                    if (xhr.readyState >= 3 && xhr.responseText) {
+                        const newText = xhr.responseText.slice(lastIndex);
+                        lastIndex = xhr.responseText.length;
+                        processChunk(newText);
+                    }
+                    if (xhr.readyState === 4) {
+                        xhrRef.current = null;
+                        // status 0 = aborted — treat as clean cancel
+                        if (xhr.status === 0 || (xhr.status >= 200 && xhr.status < 300)) {
+                            resolve();
+                        } else {
+                            reject(new Error(`Groq HTTP ${xhr.status}: ${xhr.responseText}`));
+                        }
+                    }
+                };
+
+                xhr.onerror = () => { xhrRef.current = null; reject(new Error('Network request failed')); };
+
+                xhr.open('POST', 'https://api.groq.com/openai/v1/chat/completions');
+                xhr.setRequestHeader('Content-Type', 'application/json');
+                xhr.setRequestHeader('Authorization', `Bearer ${apiKey}`);
+                xhr.send(JSON.stringify({
                     model: 'llama-3.3-70b-versatile',
                     messages,
                     max_tokens: 150,
                     temperature: 0.8,
                     stream: true,
-                }),
-                signal: controller.signal,
+                }));
             });
-            if (!response.ok) throw new Error(`Groq HTTP ${response.status}: ${await response.text()}`);
-            const reader = response.body!.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split('\n');
-                buffer = lines.pop() ?? '';
-                for (const line of lines) {
-                    const trimmed = line.trim();
-                    if (!trimmed.startsWith('data: ')) continue;
-                    const data = trimmed.slice(6);
-                    if (data === '[DONE]') break;
-                    try {
-                        const content = JSON.parse(data)?.choices?.[0]?.delta?.content;
-                        if (content) { assistantText += content; generatedTokensRef.current++; onToken?.(content); }
-                    } catch {}
-                }
-            }
         } catch (e: any) {
-            if (e?.name !== 'AbortError') throw e;
+            // Aborts resolve() cleanly (status 0), so only real errors reach here
+            throw e;
         } finally {
-            abortControllerRef.current = null;
+            xhrRef.current = null;
             setIsGenerating(false);
             const newHistory = [...trimmedHistory, userMsg, ...(assistantText ? [{ role: 'assistant' as const, content: assistantText }] : [])];
             historyRef.current = newHistory;
             setMessageHistory(newHistory);
         }
-    }, [apiKey, interrupt]);
+    }, [apiKey]);
 
     return {
         isReady,

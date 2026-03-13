@@ -10,28 +10,25 @@ import {
     TouchableWithoutFeedback,
     View
 } from 'react-native';
-// Mocks
-import { Spinner } from '../../components/MockComponents';
 import { GeneratingContext } from '../../context/GeneratingContext';
 
 // Libraries
 import { useIsFocused } from '@react-navigation/native';
 import { AudioBuffer, AudioBufferSourceNode, AudioContext, AudioManager, AudioRecorder } from 'react-native-audio-api';
 import {
-    KOKORO_MEDIUM,
-    KOKORO_VOICE_AF_HEART,
     useSpeechToText,
-    useTextToSpeech,
     useVAD,
     WHISPER_TINY_EN,
 } from 'react-native-executorch';
 import {
     clearAllModels,
     ensureModelExists,
-    KOKORO_MODEL,
+    POCKET_TTS_ONNX_MODEL,
+    POCKET_TTS_ONNX_MODEL_DIR,
     STT_VAD_MODEL,
 } from '../../services/ModelLoader';
 import { useGroqLLM } from '../../hooks/useGroqLLM';
+import { usePocketTTS } from '../../hooks/usePocketTTS';
 
 const { width } = Dimensions.get('window');
 
@@ -72,11 +69,6 @@ const NAMES = {
     female: ['Sarah', 'Emily', 'Jessica', 'Jennifer', 'Ashley']
 };
 
-const VOICES = {
-    male: ['kokoro-voice-am_adam.bin', 'kokoro-voice-am_michael.bin', 'kokoro-voice-am_santa.bin'],
-    female: ['kokoro-voice-af_heart.bin', 'kokoro-voice-af_river.bin', 'kokoro-voice-af_sarah.bin']
-};
-
 const STYLES = ['calm', 'energetic', 'thoughtful', 'witty', 'direct'];
 const DEFAULT_CONTEXT_WINDOW_LENGTH = 8;
 const HARD_RESET_CONTEXT_WINDOW_LENGTH = 4;
@@ -85,16 +77,14 @@ const TOKENIZER_MAX_PLACEHOLDER_THRESHOLD = 1_000_000_000;
 const getRandomPersona = (scenarioId: Scenario) => {
     const gender = (Math.random() > 0.5 ? 'male' : 'female') as 'male' | 'female';
     const name = NAMES[gender][Math.floor(Math.random() * NAMES[gender].length)];
-    const age = Math.floor(Math.random() * (25 - 18) + 18); // 28-25
+    const age = Math.floor(Math.random() * (25 - 18) + 18);
     const style = STYLES[Math.floor(Math.random() * STYLES.length)];
-    const voiceFile = VOICES[gender][Math.floor(Math.random() * VOICES[gender].length)];
 
     return {
         name,
         age,
         gender,
         style,
-        voiceFile,
         description: `Name: ${name}. Age: ${age}. Gender: ${gender}. Speaking Style: ${style}.`
     };
 };
@@ -164,15 +154,15 @@ function VoiceChatScreen() {
     // Ref to track session state for async callbacks (like onended)
     const sessionActiveRef = useRef(sessionActive);
     const [selectedScenario, setSelectedScenario] = useState<Scenario | null>(null);
-    const [activeVoiceFile, setActiveVoiceFile] = useState<string>('kokoro-voice-af_heart.bin');
     const [pendingSystemPrompt, setPendingSystemPrompt] = useState<string | null>(null);
     const [messages, setMessages] = useState<Message[]>([]);
 
     // Download State
     const [sttVadPaths, setSttVadPaths] = useState<Record<string, string> | null>(null);
-    const [kokoroPaths, setKokoroPaths] = useState<Record<string, string> | null>(null);
+    const [pocketTTSReady, setPocketTTSReady] = useState(false);
+    const [loadError, setLoadError] = useState<string | null>(null);
     const [downloadProgress, setDownloadProgress] = useState(0);
-    const [downloadStatus, setDownloadStatus] = useState<string>('Checking models...');
+    const [downloadStatus, setDownloadStatus] = useState<string>('Preparing AI systems...');
 
     // Audio Context
     const audioContextRef = useRef<AudioContext | null>(null);
@@ -229,24 +219,28 @@ function VoiceChatScreen() {
     const vadStopIssuedRef = useRef<boolean>(false);
     const vadHasSpeechRef = useRef<boolean>(false);
     const vadBusyRef = useRef<boolean>(false);
+    const hasAutoLoadTriggeredRef = useRef<boolean>(false);
 
     const BARGE_IN_MIN_MS = 300;
     const BARGE_IN_COOLDOWN_MS = 250;
     const MIN_BASE_THRESHOLD = 0.009;
+    const SILENCE_DURATION_MS = 900;
     const PLAYBACK_THRESHOLD = 0.06;
     const NO_SPEECH_TIMEOUT_MS = 9000;
-    const PLAYBACK_TARGET_PEAK = 0.5;
-    const PLAYBACK_MAX_GAIN = 8.0;
-    const PLAYBACK_OUTPUT_BOOST = 2.0;
+    const PLAYBACK_TARGET_PEAK = 0.7;
+    const PLAYBACK_MAX_GAIN = 12.0;
+    const PLAYBACK_OUTPUT_BOOST = 2.5;
     const FSMN_SAMPLE_RATE = 16000;
-    const FSMN_VAD_INFER_INTERVAL_MS = 100;
-    const FSMN_VAD_END_SILENCE_MS = 300;
-    const FSMN_VAD_MIN_SEGMENT_MS = 100;
+    const FSMN_VAD_INFER_INTERVAL_MS = 150;
+    const FSMN_VAD_END_SILENCE_MS = 700;
+    const FSMN_VAD_MIN_SEGMENT_MS = 250;
     const FSMN_VAD_MIN_WAVEFORM_SAMPLES = 3200;
     const FSMN_VAD_MAX_WINDOW_SECONDS = 12;
 
     // Animation
     const pulseAnim = useRef(new Animated.Value(1)).current;
+    const setupSpinAnim = useRef(new Animated.Value(0)).current;
+    const setupPulseAnim = useRef(new Animated.Value(0)).current;
 
     // 4. Orb Animation (Pulse)
 
@@ -263,30 +257,41 @@ function VoiceChatScreen() {
 
     // 1. Load Models (Manual Trigger now)
 
-    // 1. Load Models (Manual Trigger now)
     const handleLoadModels = async () => {
         try {
-            setDownloadStatus('Downloading Whisper + VAD models...');
-            const sPaths = await ensureModelExists(STT_VAD_MODEL, (p) => setDownloadProgress(p));
+            setLoadError(null);
+            setDownloadProgress(0);
+
+            setDownloadStatus('Loading Whisper + VAD...');
+            const sPaths = await ensureModelExists(STT_VAD_MODEL, (p) => setDownloadProgress(Math.max(0, Math.min(0.55, p * 0.55))));
             setSttVadPaths(sPaths);
 
-            setDownloadStatus('Downloading Kokoro...');
-            const kPaths = await ensureModelExists(KOKORO_MODEL, (p) => setDownloadProgress(p));
-            setKokoroPaths(kPaths);
+            setDownloadStatus('Preparing Pocket TTS voices...');
+            await ensureModelExists(POCKET_TTS_ONNX_MODEL, (p) => setDownloadProgress(0.55 + Math.max(0, Math.min(0.45, p * 0.45))));
+            setPocketTTSReady(true);
+            setDownloadProgress(1);
 
             setDownloadStatus('Ready');
         } catch (e) {
             console.error(e);
-            setDownloadStatus('Error downloading models: ' + e);
+            setLoadError(String(e));
+            setDownloadStatus('Unable to initialize AI models.');
         }
     };
+
+    useEffect(() => {
+        if (hasAutoLoadTriggeredRef.current) return;
+        hasAutoLoadTriggeredRef.current = true;
+        void handleLoadModels();
+    }, []);
 
     const handleClearModels = async () => {
         try {
             await clearAllModels();
             // Reset paths to null to trigger "Download" UI
             setSttVadPaths(null);
-            setKokoroPaths(null);
+            setPocketTTSReady(false);
+            setLoadError(null);
             setDownloadStatus('Models cleared. Ready to download.');
             setDownloadProgress(0);
         } catch (e) {
@@ -322,26 +327,8 @@ function VoiceChatScreen() {
         preventLoad: !sttVadPaths || !sttVadPaths['fsmn-vad_xnnpack.pte'],
     });
 
-    const ttsConfig = React.useMemo(() => kokoroPaths ? {
-        type: 'kokoro' as const,
-        durationPredictorSource: kokoroPaths['kokoro-duration-predictor.pte'],
-        synthesizerSource: kokoroPaths['kokoro-synthesizer.pte'],
-    } : KOKORO_MEDIUM, [kokoroPaths]);
-
-    const ttsVoice = React.useMemo(() => kokoroPaths ? {
-        ...KOKORO_VOICE_AF_HEART,
-        voiceSource: kokoroPaths[activeVoiceFile] || kokoroPaths['kokoro-voice-af_heart.bin'],
-        extra: {
-            taggerSource: kokoroPaths['kokoro-phonemizer-tags.json'],
-            lexiconSource: kokoroPaths['kokoro-phonemizer-us_merged.json']
-        }
-    } : KOKORO_VOICE_AF_HEART, [kokoroPaths, activeVoiceFile]);
-
-    const tts = useTextToSpeech({
-        model: ttsConfig,
-        voice: ttsVoice,
-        preventLoad: !kokoroPaths
-    });
+    const pocketTTSDir = pocketTTSReady ? POCKET_TTS_ONNX_MODEL_DIR : null;
+    const tts = usePocketTTS(pocketTTSDir);
 
     // --- Logic ---
 
@@ -358,10 +345,10 @@ function VoiceChatScreen() {
         AudioManager.setAudioSessionOptions({
             iosCategory: 'playAndRecord',
             iosMode: 'voiceChat',
-            iosOptions: ['allowBluetooth', 'defaultToSpeaker'],
+            iosOptions: ['allowBluetoothHFP', 'defaultToSpeaker'],
         });
 
-        // Initialize Audio Context for TTS (Kokoro uses 24000Hz)
+        // Initialize Audio Context for TTS (Pocket TTS uses 24000Hz)
         audioContextRef.current = new AudioContext({ sampleRate: 24000 });
         console.log('[Audio] Context initialized');
         isMountedRef.current = true;
@@ -397,6 +384,43 @@ function VoiceChatScreen() {
         }
     }, [llm.isGenerating, isPlaying, isRecording]);
 
+    const isSetupReady = Boolean(sttVadPaths) && llm.isReady && speechToText.isReady && tts.isReady && vad.isReady;
+
+    useEffect(() => {
+        if (isSetupReady) return;
+
+        const spinLoop = Animated.loop(
+            Animated.timing(setupSpinAnim, {
+                toValue: 1,
+                duration: 1800,
+                useNativeDriver: true,
+            })
+        );
+        const pulseLoop = Animated.loop(
+            Animated.sequence([
+                Animated.timing(setupPulseAnim, {
+                    toValue: 1,
+                    duration: 1200,
+                    useNativeDriver: true,
+                }),
+                Animated.timing(setupPulseAnim, {
+                    toValue: 0,
+                    duration: 1200,
+                    useNativeDriver: true,
+                }),
+            ])
+        );
+
+        spinLoop.start();
+        pulseLoop.start();
+        return () => {
+            spinLoop.stop();
+            pulseLoop.stop();
+            setupSpinAnim.setValue(0);
+            setupPulseAnim.setValue(0);
+        };
+    }, [isSetupReady, setupPulseAnim, setupSpinAnim]);
+
     // Keep ref synchronized for queued audio completion checks.
     useEffect(() => {
         isLLMGeneratingRef.current = llm.isGenerating;
@@ -431,6 +455,12 @@ function VoiceChatScreen() {
             console.warn('[VAD+FSMN] Model error:', vad.error);
         }
     }, [vad.error]);
+
+    useEffect(() => {
+        if (!tts.error) return;
+        setLoadError(tts.error.message);
+        setDownloadStatus('Pocket TTS native module failed to initialize.');
+    }, [tts.error]);
 
 
     const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -817,9 +847,16 @@ function VoiceChatScreen() {
             p.description
         );
 
-        const voiceChanged = p.voiceFile !== activeVoiceFile;
-        pendingVoiceReloadRef.current = voiceChanged;
-        setActiveVoiceFile(p.voiceFile);
+        try {
+            const primedVoice = await tts.primeVoice(p.gender);
+            console.log(`[TTS] Primed voice '${primedVoice}' for persona gender='${p.gender}'`);
+        } catch (e) {
+            console.error('[TTS] Failed to prime selected voice:', e);
+            setLoadError(`Voice priming failed: ${e instanceof Error ? e.message : String(e)}`);
+            return;
+        }
+
+        pendingVoiceReloadRef.current = false;
         activeSystemPromptRef.current = systemPrompt;
         setMessages([]);
         messagesRef.current = [];
@@ -835,7 +872,7 @@ function VoiceChatScreen() {
     };
 
     const handleRecordPress = async () => {
-        if (!sttVadPaths || !kokoroPaths) return;
+        if (!sttVadPaths || !tts.isReady) return;
         if (isStartingRef.current) return; // Prevent double-entry
         isStartingRef.current = true;
 
@@ -844,8 +881,12 @@ function VoiceChatScreen() {
         const perm = await AudioManager.requestRecordingPermissions();
         console.log('[Permissions] Result:', JSON.stringify(perm));
 
-        // Check if granted (it might return 'granted' string or an object depending on version/platform)
-        if (perm !== 'granted' && (typeof perm === 'object' && perm['status'] !== 'granted')) {
+        // Normalize permission response shape across SDK versions.
+        const permissionStatus =
+            typeof perm === 'object' && perm !== null && 'status' in (perm as object)
+                ? String((perm as { status?: unknown }).status ?? '')
+                : String(perm);
+        if (permissionStatus !== 'granted') {
             alert('Microphone permission denied');
             isStartingRef.current = false;
             return;
@@ -1094,15 +1135,48 @@ function VoiceChatScreen() {
                         onToken: (token) => {
                             if (!sessionActiveRef.current) return;
                             sentenceBuffer.current += token;
-                            const match = sentenceBuffer.current.match(/[.?!](\s|$)|[\n]/);
-                            if (match && match.index !== undefined) {
-                                const endIndex = match.index + 1;
-                                const sentence = sentenceBuffer.current.substring(0, endIndex).trim().replace(/["']/g, '');
-                                sentenceBuffer.current = sentenceBuffer.current.substring(endIndex);
-                                if (sentence.length > 0) {
-                                    console.log('[TTS Stream] Enqueueing:', sentence);
-                                    ttsQueue.current.push(sentence);
+
+                            // 1. Sentence boundary — always flush
+                            const sentenceMatch = sentenceBuffer.current.match(/[.?!](\s|$)/);
+                            if (sentenceMatch && sentenceMatch.index !== undefined) {
+                                const endIndex = sentenceMatch.index + 1;
+                                const chunk = sentenceBuffer.current.substring(0, endIndex).trim().replace(/["']/g, '');
+                                sentenceBuffer.current = sentenceBuffer.current.substring(endIndex).trimStart();
+                                if (chunk.length > 0) {
+                                    console.log('[TTS Stream] Sentence flush:', chunk);
+                                    ttsQueue.current.push(chunk);
                                     processQueue();
+                                }
+                                return;
+                            }
+
+                            // 2. Clause boundary — flush if the chunk before the comma is long enough
+                            const MIN_PHRASE_LEN = 15;
+                            const clauseMatch = sentenceBuffer.current.match(/[,;]\s/);
+                            if (clauseMatch && clauseMatch.index !== undefined && clauseMatch.index + 1 >= MIN_PHRASE_LEN) {
+                                const endIndex = clauseMatch.index + 1;
+                                const chunk = sentenceBuffer.current.substring(0, endIndex).trim().replace(/["']/g, '');
+                                sentenceBuffer.current = sentenceBuffer.current.substring(endIndex).trimStart();
+                                if (chunk.length > 0) {
+                                    console.log('[TTS Stream] Clause flush:', chunk);
+                                    ttsQueue.current.push(chunk);
+                                    processQueue();
+                                }
+                                return;
+                            }
+
+                            // 3. Hard cap — flush at last word boundary
+                            const MAX_PHRASE_LEN = 60;
+                            if (sentenceBuffer.current.length >= MAX_PHRASE_LEN) {
+                                const lastSpace = sentenceBuffer.current.lastIndexOf(' ');
+                                if (lastSpace > 0) {
+                                    const chunk = sentenceBuffer.current.substring(0, lastSpace).trim().replace(/["']/g, '');
+                                    sentenceBuffer.current = sentenceBuffer.current.substring(lastSpace + 1);
+                                    if (chunk.length > 0) {
+                                        console.log('[TTS Stream] Cap flush:', chunk);
+                                        ttsQueue.current.push(chunk);
+                                        processQueue();
+                                    }
                                 }
                             }
                         },
@@ -1325,36 +1399,48 @@ function VoiceChatScreen() {
 
     // --- Render ---
 
-    if (!sttVadPaths || !kokoroPaths || !llm.isReady || !speechToText.isReady || !tts.isReady || !vad.isReady) {
+    if (!isSetupReady) {
+        const spin = setupSpinAnim.interpolate({
+            inputRange: [0, 1],
+            outputRange: ['0deg', '360deg'],
+        });
+        const coreScale = setupPulseAnim.interpolate({
+            inputRange: [0, 1],
+            outputRange: [0.9, 1.08],
+        });
+        const coreOpacity = setupPulseAnim.interpolate({
+            inputRange: [0, 1],
+            outputRange: [0.55, 0.95],
+        });
+        const progressPercent = Math.max(4, Math.min(100, Math.round(downloadProgress * 100)));
+
         return (
-            <View style={styles.container}>
-                <View style={styles.orbContainer}>
-                    <Text style={[styles.headerTitle, { marginBottom: 20 }]}>AI Setup</Text>
+            <View style={styles.loaderContainer}>
+                <View style={styles.loaderBackgroundGlow} />
+                <Animated.View style={[styles.loaderRingOuter, { transform: [{ rotate: spin }] }]}>
+                    <View style={styles.loaderRingInner} />
+                </Animated.View>
+                <Animated.View style={[styles.loaderCore, { transform: [{ scale: coreScale }], opacity: coreOpacity }]} />
 
-                    <Text style={{ textAlign: 'center', marginBottom: 20, paddingHorizontal: 40, color: '#666' }}>
-                        {downloadStatus}
-                    </Text>
+                <Text style={styles.loaderTitle}>Launching Voice Engine</Text>
+                <Text style={styles.loaderSubtitle}>{downloadStatus}</Text>
 
-                    {downloadStatus.includes('Downloading') ? (
-                        <Spinner visible={true} textContent={`${(downloadProgress * 100).toFixed(0)}%`} />
-                    ) : (
-                        <>
-                            <TouchableOpacity
-                                style={[styles.startButton, { width: 200, marginBottom: 16 }]}
-                                onPress={handleLoadModels}
-                            >
-                                <Text style={styles.startText}>Load AI Models</Text>
-                            </TouchableOpacity>
-
-                            <TouchableOpacity
-                                style={[styles.endButtonUI, { padding: 10 }]}
-                                onPress={handleClearModels}
-                            >
-                                <Text style={{ color: 'red', fontWeight: '600', fontSize: 16 }}>Reset / Clear Cache</Text>
-                            </TouchableOpacity>
-                        </>
-                    )}
+                <View style={styles.loaderProgressTrack}>
+                    <View style={[styles.loaderProgressFill, { width: `${progressPercent}%` }]} />
                 </View>
+                <Text style={styles.loaderPercent}>{progressPercent}%</Text>
+
+                {loadError && (
+                    <View style={styles.loaderErrorBlock}>
+                        <Text style={styles.loaderErrorText}>{loadError}</Text>
+                        <TouchableOpacity style={styles.loaderRetryButton} onPress={handleLoadModels}>
+                            <Text style={styles.loaderRetryText}>Retry Setup</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity style={styles.loaderResetButton} onPress={handleClearModels}>
+                            <Text style={styles.loaderResetText}>Clear Cache</Text>
+                        </TouchableOpacity>
+                    </View>
+                )}
             </View>
         );
     }
@@ -1460,6 +1546,111 @@ const styles = StyleSheet.create({
         flex: 1,
         backgroundColor: '#FFF',
         paddingTop: Platform.OS === 'android' ? 40 : 60,
+    },
+    loaderContainer: {
+        flex: 1,
+        backgroundColor: '#09122a',
+        justifyContent: 'center',
+        alignItems: 'center',
+        paddingHorizontal: 28,
+    },
+    loaderBackgroundGlow: {
+        position: 'absolute',
+        width: 360,
+        height: 360,
+        borderRadius: 180,
+        backgroundColor: 'rgba(31, 112, 255, 0.2)',
+    },
+    loaderRingOuter: {
+        width: 172,
+        height: 172,
+        borderRadius: 86,
+        borderWidth: 6,
+        borderColor: 'rgba(129, 186, 255, 0.35)',
+        borderTopColor: '#7fd2ff',
+        borderRightColor: '#2eb6ff',
+        justifyContent: 'center',
+        alignItems: 'center',
+    },
+    loaderRingInner: {
+        width: 132,
+        height: 132,
+        borderRadius: 66,
+        borderWidth: 2,
+        borderColor: 'rgba(126, 210, 255, 0.35)',
+    },
+    loaderCore: {
+        position: 'absolute',
+        width: 88,
+        height: 88,
+        borderRadius: 44,
+        backgroundColor: '#70d6ff',
+        shadowColor: '#2eb6ff',
+        shadowOffset: { width: 0, height: 0 },
+        shadowOpacity: 0.9,
+        shadowRadius: 18,
+        elevation: 12,
+    },
+    loaderTitle: {
+        marginTop: 36,
+        fontSize: 24,
+        fontWeight: '700',
+        color: '#f4fbff',
+    },
+    loaderSubtitle: {
+        marginTop: 10,
+        fontSize: 15,
+        color: '#b7ccf3',
+        textAlign: 'center',
+    },
+    loaderProgressTrack: {
+        width: '92%',
+        height: 10,
+        borderRadius: 999,
+        backgroundColor: 'rgba(170, 197, 243, 0.25)',
+        marginTop: 24,
+        overflow: 'hidden',
+    },
+    loaderProgressFill: {
+        height: '100%',
+        borderRadius: 999,
+        backgroundColor: '#7fd2ff',
+    },
+    loaderPercent: {
+        marginTop: 8,
+        fontSize: 13,
+        color: '#95bbe3',
+        letterSpacing: 0.3,
+    },
+    loaderErrorBlock: {
+        marginTop: 22,
+        alignItems: 'center',
+        width: '100%',
+    },
+    loaderErrorText: {
+        color: '#ffd2d2',
+        textAlign: 'center',
+        marginBottom: 12,
+    },
+    loaderRetryButton: {
+        backgroundColor: '#2a7bff',
+        borderRadius: 999,
+        paddingHorizontal: 24,
+        paddingVertical: 10,
+        marginBottom: 10,
+    },
+    loaderRetryText: {
+        color: '#ffffff',
+        fontWeight: '700',
+        fontSize: 15,
+    },
+    loaderResetButton: {
+        paddingHorizontal: 16,
+        paddingVertical: 8,
+    },
+    loaderResetText: {
+        color: '#ffb9b9',
+        fontWeight: '600',
     },
     header: {
         flexDirection: 'row',

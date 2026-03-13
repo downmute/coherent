@@ -1,0 +1,223 @@
+diff --git a/node_modules/react-native-executorch/common/rnexecutorch/host_objects/ModelHostObject.h b/node_modules/react-native-executorch/common/rnexecutorch/host_objects/ModelHostObject.h
+index a1ce8e8..c3ba461 100644
+--- a/node_modules/react-native-executorch/common/rnexecutorch/host_objects/ModelHostObject.h
++++ b/node_modules/react-native-executorch/common/rnexecutorch/host_objects/ModelHostObject.h
+@@ -40,6 +40,10 @@ public:
+                                        promiseHostFunction<&Model::forwardJS>,
+                                        "forward"));
+ 
++      addFunctions(JSI_EXPORT_FUNCTION(ModelHostObject<Model>,
++                                       synchronousHostFunction<&Model::setCallMethod>,
++                                       "setMethod"));
++
+       addFunctions(JSI_EXPORT_FUNCTION(
+           ModelHostObject<Model>, promiseHostFunction<&Model::getInputShape>,
+           "getInputShape"));
+diff --git a/node_modules/react-native-executorch/common/rnexecutorch/models/BaseModel.cpp b/node_modules/react-native-executorch/common/rnexecutorch/models/BaseModel.cpp
+index 2ecc3d8..40e8db1 100644
+--- a/node_modules/react-native-executorch/common/rnexecutorch/models/BaseModel.cpp
++++ b/node_modules/react-native-executorch/common/rnexecutorch/models/BaseModel.cpp
+@@ -113,10 +113,10 @@ BaseModel::forwardJS(std::vector<JSTensorViewIn> tensorViewVec) const {
+                                       // which implicitly converts to EValue
+   }
+ 
+-  auto result = module_->forward(evalues);
++  auto result = module_->execute(callMethod_, evalues);
+   if (!result.ok()) {
+     throw RnExecutorchError(result.error(),
+-                            "The model's forward function did not succeed. "
++                            "The model's execute function did not succeed. "
+                             "Ensure the model input is correct.");
+   }
+ 
+diff --git a/node_modules/react-native-executorch/common/rnexecutorch/models/BaseModel.h b/node_modules/react-native-executorch/common/rnexecutorch/models/BaseModel.h
+index 4420103..7e1a2a2 100644
+--- a/node_modules/react-native-executorch/common/rnexecutorch/models/BaseModel.h
++++ b/node_modules/react-native-executorch/common/rnexecutorch/models/BaseModel.h
+@@ -29,6 +29,12 @@ public:
+   getInputShape(std::string method_name, int32_t index) const;
+   std::vector<std::vector<int32_t>>
+   getAllInputShapes(std::string methodName = "forward") const;
++  // NEW: mutable so setter can be called on a const BaseModel
++  mutable std::string callMethod_{"forward"};
++
++  // NEW: called from JS via synchronousHostFunction before forward()
++  void setCallMethod(std::string name) { callMethod_ = name; }
++
+   [[nodiscard("Registered non-void function")]] std::vector<JSTensorViewOut>
+   forwardJS(std::vector<JSTensorViewIn> tensorViewVec) const;
+   Result<std::vector<EValue>> forward(const EValue &input_value) const;
+diff --git a/node_modules/react-native-executorch/lib/module/controllers/LLMController.js b/node_modules/react-native-executorch/lib/module/controllers/LLMController.js
+index 39a87ef..56bdf14 100644
+--- a/node_modules/react-native-executorch/lib/module/controllers/LLMController.js
++++ b/node_modules/react-native-executorch/lib/module/controllers/LLMController.js
+@@ -14,6 +14,7 @@ export class LLMController {
+   _isReady = false;
+   _isGenerating = false;
+   _messageHistory = [];
++  lastLoadSources = undefined;
+ 
+   // User callbacks
+ 
+@@ -54,6 +55,11 @@ export class LLMController {
+     tokenizerConfigSource,
+     onDownloadProgressCallback
+   }) {
++    this.lastLoadSources = {
++      modelSource,
++      tokenizerSource,
++      tokenizerConfigSource
++    };
+     // reset inner state when loading new model
+     this.messageHistoryCallback(this.chatConfig.initialMessageHistory);
+     this.isGeneratingCallback(false);
+@@ -86,6 +92,28 @@ export class LLMController {
+       throw parseUnknownError(e);
+     }
+   }
++  async reload(onDownloadProgressCallback) {
++    if (!this.lastLoadSources) {
++      throw new RnExecutorchError(RnExecutorchErrorCode.InvalidState, 'Cannot reload model before initial load.');
++    }
++    if (this._isGenerating) {
++      this.interrupt();
++    }
++    const waitStart = Date.now();
++    while (this._isGenerating && Date.now() - waitStart < 2000) {
++      await new Promise(resolve => setTimeout(resolve, 40));
++    }
++    if (this._isGenerating) {
++      throw new RnExecutorchError(RnExecutorchErrorCode.ModelGenerating, 'Model is still generating after interrupt; cannot reload safely.');
++    }
++    if (this._isReady) {
++      this.delete();
++    }
++    await this.load({
++      ...this.lastLoadSources,
++      onDownloadProgressCallback
++    });
++  }
+   setTokenCallback(tokenCallback) {
+     this.tokenCallback = tokenCallback;
+   }
+diff --git a/node_modules/react-native-executorch/lib/module/hooks/natural_language_processing/useLLM.js b/node_modules/react-native-executorch/lib/module/hooks/natural_language_processing/useLLM.js
+index f94437e..18a8d26 100644
+--- a/node_modules/react-native-executorch/lib/module/hooks/natural_language_processing/useLLM.js
++++ b/node_modules/react-native-executorch/lib/module/hooks/natural_language_processing/useLLM.js
+@@ -75,6 +75,7 @@ export const useLLM = ({
+   }, [controllerInstance]);
+   const deleteMessage = useCallback(index => controllerInstance.deleteMessage(index), [controllerInstance]);
+   const interrupt = useCallback(() => controllerInstance.interrupt(), [controllerInstance]);
++  const reload = useCallback(onDownloadProgressCallback => controllerInstance.reload(onDownloadProgressCallback), [controllerInstance]);
+   const getGeneratedTokenCount = useCallback(() => controllerInstance.getGeneratedTokenCount(), [controllerInstance]);
+   const getPromptTokenCount = useCallback(() => controllerInstance.getPromptTokenCount(), [controllerInstance]);
+   const getTotalTokenCount = useCallback(() => controllerInstance.getTotalTokenCount(), [controllerInstance]);
+@@ -93,7 +94,8 @@ export const useLLM = ({
+     generate: generate,
+     sendMessage: sendMessage,
+     deleteMessage: deleteMessage,
+-    interrupt: interrupt
++    interrupt: interrupt,
++    reload: reload
+   };
+ };
+ //# sourceMappingURL=useLLM.js.map
+diff --git a/node_modules/react-native-executorch/src/controllers/LLMController.ts b/node_modules/react-native-executorch/src/controllers/LLMController.ts
+index 62b438f..dcb821b 100644
+--- a/node_modules/react-native-executorch/src/controllers/LLMController.ts
++++ b/node_modules/react-native-executorch/src/controllers/LLMController.ts
+@@ -21,6 +21,13 @@ export class LLMController {
+   private chatConfig: ChatConfig = DEFAULT_CHAT_CONFIG;
+   private toolsConfig: ToolsConfig | undefined;
+   private tokenizerConfig: any;
++  private lastLoadSources:
++    | {
++        modelSource: ResourceSource;
++        tokenizerSource: ResourceSource;
++        tokenizerConfigSource: ResourceSource;
++      }
++    | undefined;
+   private onToken?: (token: string) => void;
+   private _isReady = false;
+   private _isGenerating = false;
+@@ -83,6 +90,12 @@ export class LLMController {
+     tokenizerConfigSource: ResourceSource;
+     onDownloadProgressCallback?: (downloadProgress: number) => void;
+   }) {
++    this.lastLoadSources = {
++      modelSource,
++      tokenizerSource,
++      tokenizerConfigSource,
++    };
++
+     // reset inner state when loading new model
+     this.messageHistoryCallback(this.chatConfig.initialMessageHistory);
+     this.isGeneratingCallback(false);
+@@ -139,6 +152,43 @@ export class LLMController {
+     }
+   }
+ 
++  public async reload(
++    onDownloadProgressCallback?: (downloadProgress: number) => void
++  ) {
++    if (!this.lastLoadSources) {
++      throw new RnExecutorchError(
++        RnExecutorchErrorCode.InvalidState,
++        'Cannot reload model before initial load.'
++      );
++    }
++
++    if (this._isGenerating) {
++      this.interrupt();
++    }
++
++    // Wait for generating flag to settle after interrupt.
++    const waitStart = Date.now();
++    while (this._isGenerating && Date.now() - waitStart < 2000) {
++      await new Promise((resolve) => setTimeout(resolve, 40));
++    }
++
++    if (this._isGenerating) {
++      throw new RnExecutorchError(
++        RnExecutorchErrorCode.ModelGenerating,
++        'Model is still generating after interrupt; cannot reload safely.'
++      );
++    }
++
++    if (this._isReady) {
++      this.delete();
++    }
++
++    await this.load({
++      ...this.lastLoadSources,
++      onDownloadProgressCallback,
++    });
++  }
++
+   public setTokenCallback(tokenCallback: (token: string) => void) {
+     this.tokenCallback = tokenCallback;
+   }
+diff --git a/node_modules/react-native-executorch/src/hooks/natural_language_processing/useLLM.ts b/node_modules/react-native-executorch/src/hooks/natural_language_processing/useLLM.ts
+index 5578c1d..30ee33c 100644
+--- a/node_modules/react-native-executorch/src/hooks/natural_language_processing/useLLM.ts
++++ b/node_modules/react-native-executorch/src/hooks/natural_language_processing/useLLM.ts
+@@ -109,6 +109,12 @@ export const useLLM = ({ model, preventLoad = false }: LLMProps): LLMType => {
+     [controllerInstance]
+   );
+ 
++  const reload = useCallback(
++    (onDownloadProgressCallback?: (downloadProgress: number) => void) =>
++      controllerInstance.reload(onDownloadProgressCallback),
++    [controllerInstance]
++  );
++
+   const getGeneratedTokenCount = useCallback(
+     () => controllerInstance.getGeneratedTokenCount(),
+     [controllerInstance]
+@@ -140,5 +146,6 @@ export const useLLM = ({ model, preventLoad = false }: LLMProps): LLMType => {
+     sendMessage: sendMessage,
+     deleteMessage: deleteMessage,
+     interrupt: interrupt,
++    reload: reload,
+   };
+ };

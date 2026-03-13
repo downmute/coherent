@@ -1,6 +1,7 @@
 import * as FileSystem from 'expo-file-system/legacy';
 
 export const MODELS_DIR = `${FileSystem.documentDirectory}models/`;
+export const POCKET_TTS_MODEL_DIR = `${FileSystem.documentDirectory}models/pocket-tts`;
 
 export interface ModelSpec {
     name: string;
@@ -13,7 +14,6 @@ export interface ModelSpec {
 const URL_PREFIX = 'https://huggingface.co/software-mansion/react-native-executorch';
 const QWEN_TAG = 'resolve/v0.6.0';
 const WHISPER_TAG = 'resolve/v0.6.0';
-// Kokoro seems to use v0.7.0 in the library (NEXT_VERSION_TAG)
 const KOKORO_TAG = 'resolve/v0.7.0';
 
 export const PHI_MODEL: ModelSpec = {
@@ -117,6 +117,54 @@ export const QWEN_05B_MODEL: ModelSpec = {
     ]
 };
 
+const POCKET_TTS_BASE = 'https://huggingface.co/sivasub987/Pocket-TTS-ExecuTorch/resolve/main';
+const POCKET_TTS_ASSET_BASE = 'https://huggingface.co/spaces/KevinAHM/pocket-tts-web/resolve/main';
+const POCKET_TTS_ONNX_BASE = 'https://huggingface.co/KevinAHM/pocket-tts-onnx/resolve/main/onnx';
+
+export const POCKET_TTS_ONNX_MODEL_DIR = `${FileSystem.documentDirectory}models/pocket-tts-onnx`;
+
+export const POCKET_TTS_ONNX_MODEL: ModelSpec = {
+    name: 'Pocket-TTS-ONNX',
+    files: [
+        { url: `${POCKET_TTS_ONNX_BASE}/text_conditioner.onnx`,  filename: 'pocket-tts-onnx/text_conditioner.onnx' },
+        { url: `${POCKET_TTS_ONNX_BASE}/flow_lm_main_int8.onnx`, filename: 'pocket-tts-onnx/flow_lm_main.onnx' },
+        { url: `${POCKET_TTS_ONNX_BASE}/flow_lm_flow_int8.onnx`, filename: 'pocket-tts-onnx/flow_lm_flow.onnx' },
+        { url: `${POCKET_TTS_ONNX_BASE}/mimi_decoder_int8.onnx`, filename: 'pocket-tts-onnx/mimi_decoder.onnx' },
+        { url: `${POCKET_TTS_ASSET_BASE}/tokenizer.model`,        filename: 'pocket-tts-onnx/tokenizer.model' },
+        { url: `${POCKET_TTS_ASSET_BASE}/voices.bin`,             filename: 'pocket-tts-onnx/voices.bin' },
+    ]
+};
+
+export const POCKET_TTS_MODEL: ModelSpec = {
+    name: 'Pocket-TTS',
+    files: [
+        {
+            url: `${POCKET_TTS_BASE}/text_conditioner.pte`,
+            filename: 'pocket-tts/text_conditioner.pte'
+        },
+        {
+            url: `${POCKET_TTS_BASE}/flow_lm_main_bundled.pte`,
+            filename: 'pocket-tts/flow_lm_main_bundled.pte'
+        },
+        {
+            url: `${POCKET_TTS_BASE}/flow_net.pte`,
+            filename: 'pocket-tts/flow_net.pte'
+        },
+        {
+            url: `${POCKET_TTS_BASE}/mimi_decoder.pte`,
+            filename: 'pocket-tts/mimi_decoder.pte'
+        },
+        {
+            url: `${POCKET_TTS_ASSET_BASE}/tokenizer.model`,
+            filename: 'pocket-tts/tokenizer.model'
+        },
+        {
+            url: `${POCKET_TTS_ASSET_BASE}/voices.bin`,
+            filename: 'pocket-tts/voices.bin'
+        },
+    ]
+};
+
 export const KOKORO_MODEL: ModelSpec = {
     name: 'Kokoro-TTS',
     files: [
@@ -128,7 +176,6 @@ export const KOKORO_MODEL: ModelSpec = {
             url: `${URL_PREFIX}-kokoro/${KOKORO_TAG}/xnnpack/medium/synthesizer.pte`,
             filename: 'kokoro-synthesizer.pte'
         },
-        // Voices
         {
             url: `${URL_PREFIX}-kokoro/${KOKORO_TAG}/voices/af_heart.bin`,
             filename: 'kokoro-voice-af_heart.bin'
@@ -153,7 +200,6 @@ export const KOKORO_MODEL: ModelSpec = {
             url: `${URL_PREFIX}-kokoro/${KOKORO_TAG}/voices/am_santa.bin`,
             filename: 'kokoro-voice-am_santa.bin'
         },
-        // Phonemizer assets
         {
             url: `${URL_PREFIX}-kokoro/${KOKORO_TAG}/phonemizer/us_merged.json`,
             filename: 'kokoro-phonemizer-us_merged.json'
@@ -161,7 +207,7 @@ export const KOKORO_MODEL: ModelSpec = {
         {
             url: `${URL_PREFIX}-kokoro/${KOKORO_TAG}/phonemizer/tags.json`,
             filename: 'kokoro-phonemizer-tags.json'
-        }
+        },
     ]
 };
 
@@ -219,6 +265,7 @@ const formatBytes = (bytes: number) => {
 };
 
 const activeDownloads = new Map<string, Promise<string>>();
+const activeModelLoads = new Map<string, Promise<Record<string, string>>>();
 
 const downloadFileSafely = async (
     url: string,
@@ -241,6 +288,14 @@ const downloadFileSafely = async (
     // Actually, let's keep it simple: This function DOWNLOADS. It assumes you want to download.
 
     console.log(`[Flow] Starting download for ${filename}...`);
+
+    // Ensure parent directory exists (supports subdirectories like pocket-tts/)
+    const parentDir = fileUri.substring(0, fileUri.lastIndexOf('/'));
+    const parentInfo = await FileSystem.getInfoAsync(parentDir);
+    if (!parentInfo.exists) {
+        await FileSystem.makeDirectoryAsync(parentDir, { intermediates: true });
+    }
+
     let lastLogTime = 0;
 
     const downloadPromise = (async () => {
@@ -293,59 +348,73 @@ const downloadFileSafely = async (
 };
 
 export const ensureModelExists = async (model: ModelSpec, onProgress?: (progress: number) => void): Promise<Record<string, string>> => {
+    if (activeModelLoads.has(model.name)) {
+        console.log(`[ModelLoader] Joining active model load for ${model.name}...`);
+        return activeModelLoads.get(model.name)!;
+    }
+
+    const loadPromise = (async () => {
     // Return cached if available AND complete
-    if (CACHED_PATHS[model.name]) {
-        const cachedKeys = Object.keys(CACHED_PATHS[model.name]);
-        const requiredKeys = model.files.map(f => f.filename);
-        const isComplete = requiredKeys.every(k => cachedKeys.includes(k));
+        if (CACHED_PATHS[model.name]) {
+            const cachedKeys = Object.keys(CACHED_PATHS[model.name]);
+            const requiredKeys = model.files.map(f => f.filename);
+            const isComplete = requiredKeys.every(k => cachedKeys.includes(k));
 
-        if (isComplete) {
-            console.log(`Using cached paths for ${model.name}`);
-            onProgress && onProgress(1);
-            return CACHED_PATHS[model.name];
-        } else {
-            console.log(`Cache for ${model.name} is incomplete. Re-verifying.`);
-            delete CACHED_PATHS[model.name];
-        }
-    }
-
-    const dirInfo = await FileSystem.getInfoAsync(MODELS_DIR);
-    if (!dirInfo.exists) {
-        await FileSystem.makeDirectoryAsync(MODELS_DIR, { intermediates: true });
-    }
-
-    const results: Record<string, string> = {};
-
-    for (let i = 0; i < model.files.length; i++) {
-        const { filename, url } = model.files[i];
-        const fileUri = `${MODELS_DIR}${filename}`;
-
-        // Validation / Existence Check
-        let valid = await isValidFile(fileUri);
-        if (valid) {
-            console.log(`File ${filename} valid.`);
-            results[filename] = fileUri;
-            onProgress && onProgress((i + 1) / model.files.length);
-            continue;
-        } else {
-            const info = await FileSystem.getInfoAsync(fileUri);
-            if (info.exists) {
-                console.log(`Deleting invalid file: ${filename}`);
-                await FileSystem.deleteAsync(fileUri);
+            if (isComplete) {
+                console.log(`Using cached paths for ${model.name}`);
+                onProgress && onProgress(1);
+                return CACHED_PATHS[model.name];
+            } else {
+                console.log(`Cache for ${model.name} is incomplete. Re-verifying.`);
+                delete CACHED_PATHS[model.name];
             }
         }
 
-        // Sequential Download via Shared Helper
-        results[filename] = await downloadFileSafely(url, filename, (written, total) => {
-            const fileContribution = total > 0 ? (written / total) / model.files.length : 0;
-            const baseProgress = i / model.files.length;
-            if (onProgress) onProgress(baseProgress + fileContribution);
-        });
-    }
+        const dirInfo = await FileSystem.getInfoAsync(MODELS_DIR);
+        if (!dirInfo.exists) {
+            await FileSystem.makeDirectoryAsync(MODELS_DIR, { intermediates: true });
+        }
 
-    // Cache success
-    CACHED_PATHS[model.name] = results;
-    return results;
+        const results: Record<string, string> = {};
+
+        for (let i = 0; i < model.files.length; i++) {
+            const { filename, url } = model.files[i];
+            const fileUri = `${MODELS_DIR}${filename}`;
+
+            // Validation / Existence Check
+            let valid = await isValidFile(fileUri);
+            if (valid) {
+                console.log(`File ${filename} valid.`);
+                results[filename] = fileUri;
+                onProgress && onProgress((i + 1) / model.files.length);
+                continue;
+            } else {
+                const info = await FileSystem.getInfoAsync(fileUri);
+                if (info.exists) {
+                    console.log(`Deleting invalid file: ${filename}`);
+                    await FileSystem.deleteAsync(fileUri);
+                }
+            }
+
+            // Sequential Download via Shared Helper
+            results[filename] = await downloadFileSafely(url, filename, (written, total) => {
+                const fileContribution = total > 0 ? (written / total) / model.files.length : 0;
+                const baseProgress = i / model.files.length;
+                if (onProgress) onProgress(baseProgress + fileContribution);
+            });
+        }
+
+        // Cache success
+        CACHED_PATHS[model.name] = results;
+        return results;
+    })();
+
+    activeModelLoads.set(model.name, loadPromise);
+    try {
+        return await loadPromise;
+    } finally {
+        activeModelLoads.delete(model.name);
+    }
 };
 
 export const downloadAllModels = async (
@@ -354,7 +423,7 @@ export const downloadAllModels = async (
 ) => {
     const allFiles = [
         ...STT_VAD_MODEL.files.map(f => ({ ...f, model: STT_VAD_MODEL.name })),
-        ...KOKORO_MODEL.files.map(f => ({ ...f, model: KOKORO_MODEL.name }))
+        ...POCKET_TTS_ONNX_MODEL.files.map(f => ({ ...f, model: POCKET_TTS_ONNX_MODEL.name }))
     ];
 
     const totalFiles = allFiles.length;
@@ -396,6 +465,7 @@ export const downloadAllModels = async (
         fileProgress[i] = 1; // Ensure complete
         updateAggregateProgress();
     }
+
 };
 
 export const clearAllModels = async () => {
@@ -434,5 +504,16 @@ export const injectChatTemplate = async (configPath: string) => {
         }
     } catch (e) {
         console.error('[ModelLoader] Error injecting chat_template:', e);
+    }
+};
+
+export const preloadCoreModelsAtLaunch = async (): Promise<void> => {
+    try {
+        console.log('[ModelLoader] Launch preload started...');
+        await ensureModelExists(STT_VAD_MODEL);
+        await ensureModelExists(POCKET_TTS_ONNX_MODEL);
+        console.log('[ModelLoader] Launch preload complete.');
+    } catch (e) {
+        console.warn('[ModelLoader] Launch preload failed:', e);
     }
 };
