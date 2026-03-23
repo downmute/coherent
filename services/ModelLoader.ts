@@ -122,6 +122,7 @@ const POCKET_TTS_ASSET_BASE = 'https://huggingface.co/spaces/KevinAHM/pocket-tts
 const POCKET_TTS_ONNX_BASE = 'https://huggingface.co/KevinAHM/pocket-tts-onnx/resolve/main/onnx';
 
 export const POCKET_TTS_ONNX_MODEL_DIR = `${FileSystem.documentDirectory}models/pocket-tts-onnx`;
+export const DEEPFILTERNET_NORMAL_MODEL_DIR = `${FileSystem.documentDirectory}models/deepfilternet-serverless-normal`;
 
 export const POCKET_TTS_ONNX_MODEL: ModelSpec = {
     name: 'Pocket-TTS-ONNX',
@@ -130,8 +131,21 @@ export const POCKET_TTS_ONNX_MODEL: ModelSpec = {
         { url: `${POCKET_TTS_ONNX_BASE}/flow_lm_main_int8.onnx`, filename: 'pocket-tts-onnx/flow_lm_main.onnx' },
         { url: `${POCKET_TTS_ONNX_BASE}/flow_lm_flow_int8.onnx`, filename: 'pocket-tts-onnx/flow_lm_flow.onnx' },
         { url: `${POCKET_TTS_ONNX_BASE}/mimi_decoder_int8.onnx`, filename: 'pocket-tts-onnx/mimi_decoder.onnx' },
+        { url: `${POCKET_TTS_ONNX_BASE}/mimi_encoder.onnx`,      filename: 'pocket-tts-onnx/mimi_encoder.onnx' },
         { url: `${POCKET_TTS_ASSET_BASE}/tokenizer.model`,        filename: 'pocket-tts-onnx/tokenizer.model' },
         { url: `${POCKET_TTS_ASSET_BASE}/voices.bin`,             filename: 'pocket-tts-onnx/voices.bin' },
+    ]
+};
+
+const DEEPFILTERNET_HF_BASE = 'https://huggingface.co/niobures/DeepFilterNet/resolve/main/models/onnx/DeepFilterNet-Serverless/normal';
+
+export const DEEPFILTERNET_NORMAL_MODEL: ModelSpec = {
+    name: 'DeepFilterNet-Serverless-Normal',
+    files: [
+        { url: `${DEEPFILTERNET_HF_BASE}/config.ini`,  filename: 'deepfilternet-serverless-normal/config.ini' },
+        { url: `${DEEPFILTERNET_HF_BASE}/enc.onnx`,    filename: 'deepfilternet-serverless-normal/enc.onnx' },
+        { url: `${DEEPFILTERNET_HF_BASE}/erb_dec.onnx`, filename: 'deepfilternet-serverless-normal/erb_dec.onnx' },
+        { url: `${DEEPFILTERNET_HF_BASE}/df_dec.onnx`,  filename: 'deepfilternet-serverless-normal/df_dec.onnx' },
     ]
 };
 
@@ -423,7 +437,8 @@ export const downloadAllModels = async (
 ) => {
     const allFiles = [
         ...STT_VAD_MODEL.files.map(f => ({ ...f, model: STT_VAD_MODEL.name })),
-        ...POCKET_TTS_ONNX_MODEL.files.map(f => ({ ...f, model: POCKET_TTS_ONNX_MODEL.name }))
+        ...POCKET_TTS_ONNX_MODEL.files.map(f => ({ ...f, model: POCKET_TTS_ONNX_MODEL.name })),
+        ...DEEPFILTERNET_NORMAL_MODEL.files.map(f => ({ ...f, model: DEEPFILTERNET_NORMAL_MODEL.name })),
     ];
 
     const totalFiles = allFiles.length;
@@ -512,6 +527,7 @@ export const preloadCoreModelsAtLaunch = async (): Promise<void> => {
         console.log('[ModelLoader] Launch preload started...');
         await ensureModelExists(STT_VAD_MODEL);
         await ensureModelExists(POCKET_TTS_ONNX_MODEL);
+        await ensureModelExists(DEEPFILTERNET_NORMAL_MODEL);
         console.log('[ModelLoader] Launch preload complete.');
     } catch (e) {
         console.warn('[ModelLoader] Launch preload failed:', e);

@@ -886,7 +886,14 @@ function VoiceChatScreen() {
             typeof perm === 'object' && perm !== null && 'status' in (perm as object)
                 ? String((perm as { status?: unknown }).status ?? '')
                 : String(perm);
-        if (permissionStatus !== 'granted') {
+        const normalizedPermissionStatus = permissionStatus.trim().toLowerCase();
+        const hasGrantedFlag =
+            typeof perm === 'object' &&
+            perm !== null &&
+            'granted' in (perm as object) &&
+            Boolean((perm as { granted?: unknown }).granted);
+
+        if (!hasGrantedFlag && normalizedPermissionStatus !== 'granted' && normalizedPermissionStatus !== 'authorized') {
             alert('Microphone permission denied');
             isStartingRef.current = false;
             return;

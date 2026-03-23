@@ -13,7 +13,8 @@ import { InferenceSession as OrtSession, Tensor as OrtTensor } from 'onnxruntime
 
 // --- Tuning Constants ---
 const LSD_STEPS = 3;             // ODE steps per AR frame (1=fastest, 10=highest quality)
-const FIRST_CHUNK_FRAMES = 3;    // Frames before first audio decode (latency vs quality)
+const NAN_WARMUP_FRAMES = 3;     // First N frames use NaN-BOS conditioning — decode through mimi to build state but drop audio
+const FIRST_CHUNK_FRAMES = 7;    // Frames decoded (after warmup) before first audio is emitted
 const NORMAL_CHUNK_FRAMES = 12;  // Frames per subsequent decode call
 const EOS_THRESHOLD = -4.0;      // eos_logit threshold for end-of-speech
 const FRAMES_AFTER_EOS = 3;      // Extra frames after EOS for natural tail
@@ -230,12 +231,37 @@ class ONNXMimiDecoder {
     }
 }
 
+// --- ONNX Mimi Encoder (converts raw PCM audio → voice embeddings) ---
+class ONNXMimiEncoder {
+    constructor(private readonly session: OrtSession) {
+        console.log('[PocketTTS] MimiEncoder inputNames:', session.inputNames.join(', '));
+        console.log('[PocketTTS] MimiEncoder outputNames:', session.outputNames.join(', '));
+    }
+
+    /** Encode raw PCM float32 audio → voice embeddings [1, N, 1024]. */
+    async encode(audioData: Float32Array): Promise<{ data: Float32Array; shape: [number, number, number] }> {
+        const outputs = await this.session.run({
+            audio: new OrtTensor('float32', audioData, [1, 1, audioData.length]),
+        }) as Record<string, OrtTensor>;
+        const emb  = outputs[this.session.outputNames[0]];
+        const dims = Array.from(emb.dims);
+        const data = new Float32Array(emb.data as Float32Array);
+        const shape: [number, number, number] = dims.length === 3
+            ? [dims[0], dims[1], dims[2]]
+            : [1, dims[0], dims[1]];
+        return { data, shape };
+    }
+
+    dispose(): void { try { this.session.release(); } catch {} }
+}
+
 // --- Session Bundle ---
 interface ONNXSessionBundle {
     textConditioner: OrtSession;
     backbone: ONNXBackboneAdapter;
     flowNet: OrtSession;
     mimiDecoder: ONNXMimiDecoder;
+    mimiEncoder: ONNXMimiEncoder;
 }
 
 // --- Path Helpers ---
@@ -290,6 +316,13 @@ async function readBinaryFile(path: string): Promise<Uint8Array> {
     return decodeBase64ToBytes(b64);
 }
 
+function encodeBase64FromBuffer(buf: ArrayBuffer): string {
+    const bytes = new Uint8Array(buf);
+    let s = '';
+    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s);
+}
+
 async function ensureDirectory(path: string): Promise<void> {
     const info = await FileSystem.getInfoAsync(path);
     if (!info.exists) {
@@ -312,119 +345,98 @@ interface VoiceDescriptor {
     voice: Voice;
 }
 
-// --- Reference Voice Assets (bundled .safetensors) ---
+// --- Reference Voice Assets (bundled .wav) ---
 const REFERENCE_VOICE_ASSETS: { name: string; moduleId: number }[] = [
-    { name: 'female1', moduleId: require('../voices/female1_voice.safetensors') as number },
-    { name: 'female2', moduleId: require('../voices/female2_voice.safetensors') as number },
-    { name: 'female3', moduleId: require('../voices/female3_voice.safetensors') as number },
-    { name: 'female4', moduleId: require('../voices/female4_voice.safetensors') as number },
-    { name: 'male1',   moduleId: require('../voices/male1_voice.safetensors') as number },
-    { name: 'male2',   moduleId: require('../voices/male2_voice.safetensors') as number },
-    { name: 'male3',   moduleId: require('../voices/male3_voice.safetensors') as number },
+    { name: 'female1', moduleId: require('../voices/female1.wav') as number },
+    { name: 'female2', moduleId: require('../voices/female2.wav') as number },
+    { name: 'female3', moduleId: require('../voices/female3.wav') as number },
+    { name: 'female4', moduleId: require('../voices/female4.wav') as number },
+    { name: 'female5', moduleId: require('../voices/female5.wav') as number },
+    { name: 'male1',   moduleId: require('../voices/male1.wav')   as number },
+    { name: 'male2',   moduleId: require('../voices/male2.wav')   as number },
+    { name: 'male3',   moduleId: require('../voices/male3.wav')   as number },
+    { name: 'male4',   moduleId: require('../voices/male4.wav')   as number },
 ];
 
-// --- Safetensors Voice Parser ---
-function readUint64LE(bytes: Uint8Array, offset: number): number {
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    const low  = view.getUint32(offset,     true);
-    const high = view.getUint32(offset + 4, true);
-    return high * 0x1_0000_0000 + low;
+// --- WAV PCM Parser ---
+const TTS_SAMPLE_RATE = 24000;
+
+function resampleLinear(input: Float32Array, fromRate: number, toRate: number): Float32Array {
+    if (fromRate === toRate) return input;
+    const ratio = fromRate / toRate;
+    const outLen = Math.floor(input.length / ratio);
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+        const pos = i * ratio;
+        const lo = Math.floor(pos);
+        const hi = Math.min(lo + 1, input.length - 1);
+        const frac = pos - lo;
+        out[i] = input[lo] * (1 - frac) + input[hi] * frac;
+    }
+    return out;
 }
 
-function parseReferenceVoice(bytes: Uint8Array, voiceName: string): Voice {
-    if (bytes.byteLength < 16) {
-        throw new Error(`[PocketTTS] Voice safetensor is too small: ${voiceName}`);
+function parseWavToFloat32(bytes: Uint8Array): Float32Array {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let audioFormat = 1, numChannels = 1, sampleRate = 24000, bitsPerSample = 16;
+    let dataOffset = 0, dataSize = 0;
+    let pos = 12;
+    while (pos + 8 <= bytes.byteLength) {
+        const id = String.fromCharCode(bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]);
+        const size = view.getUint32(pos + 4, true);
+        pos += 8;
+        if (id === 'fmt ') {
+            audioFormat   = view.getUint16(pos,      true);
+            numChannels   = view.getUint16(pos + 2,  true);
+            sampleRate    = view.getUint32(pos + 4,  true);
+            bitsPerSample = view.getUint16(pos + 14, true);
+        } else if (id === 'data') {
+            dataOffset = pos; dataSize = size; break;
+        }
+        pos += size + (size & 1);
     }
-
-    const headerLength = readUint64LE(bytes, 0);
-    const headerStart  = 8;
-    const headerEnd    = headerStart + headerLength;
-    if (headerEnd >= bytes.byteLength) {
-        throw new Error(`[PocketTTS] Invalid safetensor header length for ${voiceName}`);
+    if (dataOffset === 0) throw new Error('[PocketTTS] WAV data chunk not found');
+    const bytesPerSample = bitsPerSample / 8;
+    const frameSize = bytesPerSample * numChannels;
+    const numFrames = Math.min(Math.floor(dataSize / frameSize), sampleRate * 5); // cap at 5s
+    const out = new Float32Array(numFrames);
+    for (let i = 0; i < numFrames; i++) {
+        const p = dataOffset + i * frameSize;
+        if (bitsPerSample === 16) {
+            out[i] = view.getInt16(p, true) / 32768.0;
+        } else if (bitsPerSample === 32 && audioFormat === 3) {
+            out[i] = view.getFloat32(p, true);
+        }
+        // channel 0 only (skip other channels for stereo)
     }
-
-    const headerJson = new TextDecoder().decode(bytes.subarray(headerStart, headerEnd));
-    const header = JSON.parse(headerJson) as Record<string, unknown>;
-    const entry  = Object.entries(header).find(([key, value]) => {
-        if (key === '__metadata__') return false;
-        if (!value || typeof value !== 'object') return false;
-        return (
-            Array.isArray((value as any).shape) &&
-            Array.isArray((value as any).data_offsets) &&
-            typeof (value as any).dtype === 'string'
-        );
-    });
-
-    if (!entry) {
-        throw new Error(`[PocketTTS] No tensor payload found in safetensor: ${voiceName}`);
-    }
-
-    const tensor = entry[1] as { dtype: string; shape: number[]; data_offsets: [number, number] };
-    if (tensor.dtype !== 'F32') {
-        throw new Error(`[PocketTTS] Unsupported tensor dtype (${tensor.dtype}) in ${voiceName}`);
-    }
-
-    const shape = tensor.shape;
-    const [relativeStart, relativeEnd] = tensor.data_offsets;
-    const dataSectionStart = headerEnd;
-    const dataStart = dataSectionStart + relativeStart;
-    const dataEnd   = dataSectionStart + relativeEnd;
-    if (dataStart < headerEnd || dataEnd > bytes.byteLength || dataEnd <= dataStart) {
-        throw new Error(`[PocketTTS] Invalid tensor data offsets in ${voiceName}`);
-    }
-
-    let frames = 0, embDim = 0;
-    if (shape.length === 3) {
-        if (shape[0] !== 1) throw new Error(`[PocketTTS] Expected batch=1 for ${voiceName}`);
-        frames = shape[1]; embDim = shape[2];
-    } else if (shape.length === 2) {
-        frames = shape[0]; embDim = shape[1];
-    } else {
-        throw new Error(`[PocketTTS] Unsupported tensor rank (${shape.length}) in ${voiceName}`);
-    }
-
-    const floatCount = (dataEnd - dataStart) / 4;
-    if (frames * embDim !== floatCount) {
-        throw new Error(`[PocketTTS] Shape mismatch in ${voiceName}`);
-    }
-
-    const dataView = new DataView(bytes.buffer, bytes.byteOffset + dataStart, dataEnd - dataStart);
-    const data = new Float32Array(floatCount);
-    for (let i = 0; i < floatCount; i++) data[i] = dataView.getFloat32(i * 4, true);
-
-    return { name: voiceName, data, shape: [1, frames, embDim] };
+    return sampleRate === TTS_SAMPLE_RATE ? out : resampleLinear(out, sampleRate, TTS_SAMPLE_RATE);
 }
 
 async function ensureReferenceVoiceFiles(referenceDir: string): Promise<void> {
     await ensureDirectory(referenceDir);
-
     for (const assetDef of REFERENCE_VOICE_ASSETS) {
-        const targetPath = `${referenceDir}/${assetDef.name}.safetensors`;
+        const targetPath = `${referenceDir}/${assetDef.name}.wav`;
         const targetInfo = await FileSystem.getInfoAsync(targetPath);
         if (targetInfo.exists && targetInfo.size > 1000) continue;
-
         const asset = Asset.fromModule(assetDef.moduleId);
         await asset.downloadAsync();
         const sourceUri = asset.localUri ?? asset.uri;
-        if (!sourceUri) {
-            throw new Error(`[PocketTTS] Missing asset URI for reference voice '${assetDef.name}'.`);
-        }
+        if (!sourceUri) throw new Error(`[PocketTTS] Missing asset URI for '${assetDef.name}'.`);
         await FileSystem.copyAsync({ from: sourceUri, to: targetPath });
     }
 }
 
-async function loadReferenceVoices(referenceDir: string): Promise<Voice[]> {
+async function loadReferenceWavPCM(referenceDir: string): Promise<{ name: string; pcm: Float32Array }[]> {
     const dirInfo = await FileSystem.getInfoAsync(referenceDir);
     if (!dirInfo.exists) return [];
-
     const entries = await FileSystem.readDirectoryAsync(referenceDir);
-    const voices: Voice[] = [];
-    for (const entry of entries.filter(n => n.endsWith('.safetensors')).sort()) {
-        const name  = entry.replace(/\.safetensors$/i, '');
+    const result: { name: string; pcm: Float32Array }[] = [];
+    for (const entry of entries.filter(n => n.endsWith('.wav')).sort()) {
+        const name  = entry.replace(/\.wav$/i, '');
         const bytes = await readBinaryFile(`${referenceDir}/${entry}`);
-        voices.push(parseReferenceVoice(bytes, name));
+        result.push({ name, pcm: parseWavToFloat32(bytes) });
     }
-    return voices;
+    return result;
 }
 
 // --- Protobuf Varint (for SentencePiece tokenizer) ---
@@ -786,6 +798,7 @@ export function usePocketTTS(modelDir: string | null): PocketTTSHook {
             bundle.backbone.dispose();
             try { bundle.flowNet.release(); } catch {}
             bundle.mimiDecoder.dispose();
+            bundle.mimiEncoder.dispose();
         };
 
         disposeSessions(sessionsRef.current);
@@ -800,16 +813,18 @@ export function usePocketTTS(modelDir: string | null): PocketTTSHook {
                 const bbPath   = toNativeFsPath(`${modelDir}/flow_lm_main.onnx`);
                 const flPath   = toNativeFsPath(`${modelDir}/flow_lm_flow.onnx`);
                 const mimiPath = toNativeFsPath(`${modelDir}/mimi_decoder.onnx`);
+                const encPath  = toNativeFsPath(`${modelDir}/mimi_encoder.onnx`);
 
-                for (const p of [tcPath, bbPath, flPath, mimiPath]) {
+                for (const p of [tcPath, bbPath, flPath, mimiPath, encPath]) {
                     await assertFileExists(p);
                 }
 
-                const [tcSession, bbSession, flSession, mimiSession] = await Promise.all([
+                const [tcSession, bbSession, flSession, mimiSession, encSession] = await Promise.all([
                     OrtSession.create(tcPath),
                     OrtSession.create(bbPath),
                     OrtSession.create(flPath),
                     OrtSession.create(mimiPath),
+                    OrtSession.create(encPath),
                 ]);
 
                 if (cancelled) {
@@ -817,11 +832,13 @@ export function usePocketTTS(modelDir: string | null): PocketTTSHook {
                     try { bbSession.release(); } catch {}
                     try { flSession.release(); } catch {}
                     try { mimiSession.release(); } catch {}
+                    try { encSession.release(); } catch {}
                     return;
                 }
 
                 const backbone    = new ONNXBackboneAdapter(bbSession);
                 const mimiDecoder = new ONNXMimiDecoder(mimiSession);
+                const mimiEncoder = new ONNXMimiEncoder(encSession);
 
                 console.log('[PocketTTS] Flow net inputNames:', flSession.inputNames.join(', '));
                 console.log('[PocketTTS] Flow net outputNames:', flSession.outputNames.join(', '));
@@ -838,9 +855,9 @@ export function usePocketTTS(modelDir: string | null): PocketTTSHook {
                 backbone.reset(); // initialize zero state tensors with correct shapes
                 mimiDecoder.setAllInputMetas(mimiMetas);
                 mimiDecoder.reset();
-                if (cancelled) { disposeSessions({ textConditioner: tcSession, backbone, flowNet: flSession, mimiDecoder }); return; }
+                if (cancelled) { disposeSessions({ textConditioner: tcSession, backbone, flowNet: flSession, mimiDecoder, mimiEncoder }); return; }
 
-                sessionsRef.current = { textConditioner: tcSession, backbone, flowNet: flSession, mimiDecoder };
+                sessionsRef.current = { textConditioner: tcSession, backbone, flowNet: flSession, mimiDecoder, mimiEncoder };
 
                 // Probe text_conditioner to discover embedding width
                 initPhase = 'probe-text-conditioner';
@@ -876,15 +893,13 @@ export function usePocketTTS(modelDir: string | null): PocketTTSHook {
                 const voiceBytes     = await readBinaryFile(`${modelDir}/voices.bin`);
                 const compiledVoices = parseVoicesBin(voiceBytes);
                 console.log(`[PocketTTS] ${compiledVoices.length} compiled voice(s) loaded`);
-                const referenceVoices = await loadReferenceVoices(referenceDir);
-                console.log(`[PocketTTS] ${referenceVoices.length} reference voice(s) loaded`);
+                const referenceWavs = await loadReferenceWavPCM(referenceDir);
+                console.log(`[PocketTTS] ${referenceWavs.length} reference WAV(s) loaded`);
 
-                if (compiledVoices.length === 0 && referenceVoices.length === 0) {
+                if (compiledVoices.length === 0 && referenceWavs.length === 0) {
                     throw new Error('[PocketTTS] No voice assets were available.');
                 }
 
-                // Only register voices whose embedding dim matches the backbone's text_embeddings input.
-                // Reference safetensors voices store raw audio features (125-dim) not backbone embeddings.
                 const requiredEmbDim = backbone.textEmbDim;
                 console.log(`[PocketTTS] Filtering voices to embDim=${requiredEmbDim}`);
 
@@ -898,14 +913,57 @@ export function usePocketTTS(modelDir: string | null): PocketTTSHook {
                     voiceNames.push(voice.name);
                     console.log(`[PocketTTS] Compiled voice '${voice.name}' registered`);
                 }
-                for (const voice of referenceVoices) {
-                    if (voice.shape[2] !== requiredEmbDim) {
-                        console.log(`[PocketTTS] Reference voice '${voice.name}' skipped (embDim=${voice.shape[2]} != ${requiredEmbDim})`);
-                        continue;
+
+                for (const { name, pcm } of referenceWavs) {
+                    const cacheFile = `${referenceDir}/${name}.emb`;
+                    let encoded: Voice;
+                    const cacheInfo = await FileSystem.getInfoAsync(cacheFile);
+                    if (cacheInfo.exists) {
+                        const bytes = await readBinaryFile(cacheFile);
+                        // Version check: first byte must be 0x03 (resampled-to-24kHz cache)
+                        // Layout: [version:u32 LE=3][N:u32 LE][D:u32 LE][N*D float32] — 12-byte header (4-byte aligned)
+                        if (bytes[0] !== 0x03) {
+                            console.log(`[PocketTTS] Stale cache for '${name}', re-encoding...`);
+                            await FileSystem.deleteAsync(cacheFile);
+                            // fall through to encode
+                        } else {
+                            const dv = new DataView(bytes.buffer, bytes.byteOffset);
+                            const N = dv.getUint32(4, true);
+                            const D = dv.getUint32(8, true);
+                            const raw = new Float32Array(bytes.buffer, bytes.byteOffset + 12, N * D);
+                            const data = new Float32Array(N * D); data.set(raw);
+                            encoded = { name, data, shape: [1, N, D] };
+                            console.log(`[PocketTTS] Loaded cached embedding '${name}' [1,${N},${D}]`);
+                            if (encoded.shape[2] === requiredEmbDim) {
+                                voiceMapRef.current.set(encoded.name, { name: encoded.name, source: 'reference', voice: encoded });
+                                voiceNames.push(encoded.name);
+                            }
+                            continue;
+                        }
                     }
-                    voiceMapRef.current.set(voice.name, { name: voice.name, source: 'reference', voice });
-                    voiceNames.push(voice.name);
-                    console.log(`[PocketTTS] Reference voice '${voice.name}' registered`);
+
+                    console.log(`[PocketTTS] Encoding '${name}' via mimi_encoder (pcm samples=${pcm.length})...`);
+                    const result = await sessionsRef.current!.mimiEncoder.encode(pcm);
+                    encoded = { name, data: result.data, shape: result.shape };
+                    const [, N, D] = result.shape;
+                    // Write versioned cache: [version:u32 LE=3][N:u32 LE][D:u32 LE][N*D float32]
+                    // 12-byte header keeps float data 4-byte aligned (offset 12 % 4 == 0)
+                    const buf = new ArrayBuffer(12 + N * D * 4);
+                    new DataView(buf).setUint32(0, 3, true);  // version=3, so bytes[0]=0x03 (audio resampled to 24kHz)
+                    new DataView(buf).setUint32(4, N, true);
+                    new DataView(buf).setUint32(8, D, true);
+                    new Float32Array(buf, 12).set(result.data);
+                    await FileSystem.writeAsStringAsync(cacheFile,
+                        encodeBase64FromBuffer(buf), { encoding: FileSystem.EncodingType.Base64 });
+                    console.log(`[PocketTTS] Cached '${name}' [1,${N},${D}]`);
+
+                    if (encoded.shape[2] === requiredEmbDim) {
+                        voiceMapRef.current.set(encoded.name, { name: encoded.name, source: 'reference', voice: encoded });
+                        voiceNames.push(encoded.name);
+                        console.log(`[PocketTTS] Reference voice '${encoded.name}' registered`);
+                    } else {
+                        console.warn(`[PocketTTS] '${encoded.name}' encoded dim=${encoded.shape[2]} != ${requiredEmbDim} — skipping`);
+                    }
                 }
 
                 const uniqueVoiceNames = Array.from(new Set(voiceNames));
@@ -1005,15 +1063,17 @@ export function usePocketTTS(modelDir: string | null): PocketTTSHook {
             let eosStep: number | null = null;
             const dt = 1.0 / LSD_STEPS;
 
-            const decodeChunk = async (fromFrame: number, toFrame: number) => {
+            const decodeChunk = async (fromFrame: number, toFrame: number, emit = true) => {
                 const count = toFrame - fromFrame;
                 if (count <= 0 || abortRef.current) return;
                 const packed = new Float32Array(count * 32);
                 for (let i = 0; i < count; i++) packed.set(allLatents[fromFrame + i], i * 32);
-                console.log(`[PocketTTS] Mimi decode frames=${count} (${fromFrame}–${toFrame - 1})`);
+                console.log(`[PocketTTS] Mimi decode frames=${count} (${fromFrame}–${toFrame - 1})${emit ? '' : ' [warmup, dropped]'}`);
                 const audioData = await mimiDecoder.decode(packed, count);
-                console.log(`[PocketTTS] Decoded ${audioData.length} samples`);
-                if (!abortRef.current) onNext?.(new Float32Array(audioData));
+                if (emit) {
+                    console.log(`[PocketTTS] Decoded ${audioData.length} samples`);
+                    if (!abortRef.current) onNext?.(new Float32Array(audioData));
+                }
                 decodedFrames = toFrame;
             };
 
@@ -1053,10 +1113,17 @@ export function usePocketTTS(modelDir: string | null): PocketTTSHook {
                 const pending    = allLatents.length - decodedFrames;
 
                 if (shouldStop) {
+                    // Ensure warmup frames are decoded (state built) even on early EOS
+                    if (decodedFrames === 0 && allLatents.length > NAN_WARMUP_FRAMES) {
+                        await decodeChunk(0, NAN_WARMUP_FRAMES, false);
+                    }
                     await decodeChunk(decodedFrames, allLatents.length);
                     break;
-                } else if (decodedFrames === 0 && pending >= FIRST_CHUNK_FRAMES) {
-                    await decodeChunk(0, FIRST_CHUNK_FRAMES);
+                } else if (decodedFrames === 0 && pending >= NAN_WARMUP_FRAMES + FIRST_CHUNK_FRAMES) {
+                    // First: run warmup frames through mimi to build state (no audio emitted)
+                    await decodeChunk(0, NAN_WARMUP_FRAMES, false);
+                    // Then: emit first real audio chunk
+                    await decodeChunk(NAN_WARMUP_FRAMES, NAN_WARMUP_FRAMES + FIRST_CHUNK_FRAMES);
                 } else if (decodedFrames > 0 && pending >= NORMAL_CHUNK_FRAMES) {
                     await decodeChunk(decodedFrames, decodedFrames + NORMAL_CHUNK_FRAMES);
                 }

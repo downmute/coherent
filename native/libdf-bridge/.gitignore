@@ -1,0 +1,3 @@
+build/
+ios/LibDF.xcframework/
+vendor/libDF/target/
