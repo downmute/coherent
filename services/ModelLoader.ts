@@ -123,6 +123,7 @@ const POCKET_TTS_ONNX_BASE = 'https://huggingface.co/KevinAHM/pocket-tts-onnx/re
 
 export const POCKET_TTS_ONNX_MODEL_DIR = `${FileSystem.documentDirectory}models/pocket-tts-onnx`;
 export const DEEPFILTERNET_NORMAL_MODEL_DIR = `${FileSystem.documentDirectory}models/deepfilternet-serverless-normal`;
+export const PARAKEET_REALTIME_FP16_MODEL_DIR = `${FileSystem.documentDirectory}models/parakeet-realtime-eou-120m-v1-fp16`;
 
 export const POCKET_TTS_ONNX_MODEL: ModelSpec = {
     name: 'Pocket-TTS-ONNX',
@@ -138,6 +139,7 @@ export const POCKET_TTS_ONNX_MODEL: ModelSpec = {
 };
 
 const DEEPFILTERNET_HF_BASE = 'https://huggingface.co/niobures/DeepFilterNet/resolve/main/models/onnx/DeepFilterNet-Serverless/normal';
+const PARAKEET_REALTIME_ONNX_BASE = 'https://huggingface.co/ysdede/parakeet-realtime-eou-120m-v1-onnx/resolve/main';
 
 export const DEEPFILTERNET_NORMAL_MODEL: ModelSpec = {
     name: 'DeepFilterNet-Serverless-Normal',
@@ -146,6 +148,16 @@ export const DEEPFILTERNET_NORMAL_MODEL: ModelSpec = {
         { url: `${DEEPFILTERNET_HF_BASE}/enc.onnx`,    filename: 'deepfilternet-serverless-normal/enc.onnx' },
         { url: `${DEEPFILTERNET_HF_BASE}/erb_dec.onnx`, filename: 'deepfilternet-serverless-normal/erb_dec.onnx' },
         { url: `${DEEPFILTERNET_HF_BASE}/df_dec.onnx`,  filename: 'deepfilternet-serverless-normal/df_dec.onnx' },
+    ]
+};
+
+export const PARAKEET_REALTIME_FP16_MODEL: ModelSpec = {
+    name: 'Parakeet-Realtime-EOU-120M-FP16',
+    files: [
+        { url: `${PARAKEET_REALTIME_ONNX_BASE}/config.json`, filename: 'parakeet-realtime-eou-120m-v1-fp16/config.json' },
+        { url: `${PARAKEET_REALTIME_ONNX_BASE}/vocab.txt`, filename: 'parakeet-realtime-eou-120m-v1-fp16/vocab.txt' },
+        { url: `${PARAKEET_REALTIME_ONNX_BASE}/encoder-model.fp16.onnx`, filename: 'parakeet-realtime-eou-120m-v1-fp16/encoder-model.fp16.onnx' },
+        { url: `${PARAKEET_REALTIME_ONNX_BASE}/decoder_joint-model.fp16.onnx`, filename: 'parakeet-realtime-eou-120m-v1-fp16/decoder_joint-model.fp16.onnx' },
     ]
 };
 
@@ -228,14 +240,33 @@ export const KOKORO_MODEL: ModelSpec = {
 // Cache loaded paths to prevent re-checking/re-downloading within same session
 const CACHED_PATHS: Record<string, Record<string, string>> = {};
 
+const getMinimumExpectedBytes = (fileUri: string): number => {
+    const lower = fileUri.toLowerCase();
+    if (lower.endsWith('.json') || lower.endsWith('.txt') || lower.endsWith('.ini')) {
+        return 16;
+    }
+    return 1000;
+};
+
+const looksLikeHtmlError = (content: string): boolean => {
+    const trimmed = content.trimStart().toLowerCase();
+    return (
+        trimmed.startsWith('<!doctype html') ||
+        trimmed.startsWith('<html') ||
+        trimmed.startsWith('<head') ||
+        trimmed.startsWith('<body')
+    );
+};
+
 const isValidFile = async (fileUri: string): Promise<boolean> => {
     try {
         const info = await FileSystem.getInfoAsync(fileUri);
         if (!info.exists) return false;
 
         // 1. Check size (filter out tiny error responses)
-        if (info.size < 1000) {
-            console.log(`[Validation] File ${fileUri} is too small (${info.size} bytes).`);
+        const minBytes = getMinimumExpectedBytes(fileUri);
+        if (info.size < minBytes) {
+            console.log(`[Validation] File ${fileUri} is too small (${info.size} bytes, expected at least ${minBytes}).`);
             return false;
         }
 
@@ -245,12 +276,11 @@ const isValidFile = async (fileUri: string): Promise<boolean> => {
             const content = await FileSystem.readAsStringAsync(fileUri, { encoding: FileSystem.EncodingType.UTF8, length: 50 });
             const trimmed = content.trim();
             const isJson = fileUri.endsWith('.json');
+            const isTextAsset = fileUri.endsWith('.txt') || fileUri.endsWith('.ini');
 
-            // Fail if HTML (any file) OR if JSON error (non-JSON files)
-            // Valid JSON files can start with '{'
-            if (trimmed.startsWith('<') || (!isJson && trimmed.startsWith('{'))) {
+            // Fail if HTML-like text (any file) OR if JSON content appears where a non-JSON binary/text asset was expected.
+            if (looksLikeHtmlError(trimmed) || (!isJson && !isTextAsset && trimmed.startsWith('{'))) {
                 console.log(`[Validation] FAILED. Uri: ${fileUri}, IsJson: ${isJson}, Header: ${trimmed.substring(0, 20)}`);
-                //console.log(`[Validation] File ${fileUri} appears to be HTML or JSON error (invalid). Header: ${trimmed.substring(0, 20)}`);
                 return false;
             }
         } catch (e) {
@@ -436,7 +466,7 @@ export const downloadAllModels = async (
     onStatus?: (status: string) => void
 ) => {
     const allFiles = [
-        ...STT_VAD_MODEL.files.map(f => ({ ...f, model: STT_VAD_MODEL.name })),
+        ...PARAKEET_REALTIME_FP16_MODEL.files.map(f => ({ ...f, model: PARAKEET_REALTIME_FP16_MODEL.name })),
         ...POCKET_TTS_ONNX_MODEL.files.map(f => ({ ...f, model: POCKET_TTS_ONNX_MODEL.name })),
         ...DEEPFILTERNET_NORMAL_MODEL.files.map(f => ({ ...f, model: DEEPFILTERNET_NORMAL_MODEL.name })),
     ];
@@ -525,7 +555,7 @@ export const injectChatTemplate = async (configPath: string) => {
 export const preloadCoreModelsAtLaunch = async (): Promise<void> => {
     try {
         console.log('[ModelLoader] Launch preload started...');
-        await ensureModelExists(STT_VAD_MODEL);
+        await ensureModelExists(PARAKEET_REALTIME_FP16_MODEL);
         await ensureModelExists(POCKET_TTS_ONNX_MODEL);
         await ensureModelExists(DEEPFILTERNET_NORMAL_MODEL);
         console.log('[ModelLoader] Launch preload complete.');

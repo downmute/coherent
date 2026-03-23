@@ -16,17 +16,14 @@ import { GeneratingContext } from '../../context/GeneratingContext';
 import { useIsFocused } from '@react-navigation/native';
 import { AudioBuffer, AudioBufferSourceNode, AudioContext, AudioManager, AudioRecorder } from 'react-native-audio-api';
 import {
-    useSpeechToText,
-    useVAD,
-    WHISPER_TINY_EN,
-} from 'react-native-executorch';
-import {
     clearAllModels,
     ensureModelExists,
+    PARAKEET_REALTIME_FP16_MODEL,
+    PARAKEET_REALTIME_FP16_MODEL_DIR,
     POCKET_TTS_ONNX_MODEL,
     POCKET_TTS_ONNX_MODEL_DIR,
-    STT_VAD_MODEL,
 } from '../../services/ModelLoader';
+import { useParakeetASR } from '../../hooks/useParakeetASR';
 import { useGroqLLM } from '../../hooks/useGroqLLM';
 import { usePocketTTS } from '../../hooks/usePocketTTS';
 
@@ -112,7 +109,7 @@ const createAudioBufferFromVector = (
 const buildSystemPrompt = (scenarioPrompt: string, personaDescription: string) => {
     return [
         '#ROLE',
-        "You talk like a college student or young adult in a casual voice conversation.\n\n# VOICE-SPECIFIC RULES (CRITICAL)\n1. BREVITY: Keep 90% of responses under 15 words. Never use bulleted lists or long intros. Speak in short bursts.\n2. FILLERS: Use \"um,\" \"uh,\" or \"wait...\" at the start of responses if the question is complex to mask latency.\n3. PHONETIC CASUALTY: Use \"gonna,\" \"wanna,\" \"gotta,\" and \"dunno\" to ensure the TTS engine sounds relaxed.\n4. CONTRACTIONS: Always use \"don't,\" \"can't,\" \"it's,\" and \"should've.\" Never use formal \"do not\" or \"it is.\"\n5. NO DISCLAIMERS: Never say \"As an AI\" or \"I am programmed to.\" If you don't know, just say \"no clue tbh\" or \"I'd have to look that up.\"\n\n# TONE & STYLE\n- NO CRINGE SLANG: Do not use \"rizz,\" \"bussin,\" or \"cap.\" It sounds like you're trying too hard.\n- FUNCTIONAL SLANG: Use \"lowkey,\" \"highkey,\" \"tbh,\" \"fr,\" and \"literally\" sparingly.\n- OPINIONATED: Have mild preferences. Instead of \"it's subjective,\" say \"honestly, [Option A] is way better.\"\n- THE \"TEXT\" VIBE: Speak with the grammar of a casual text message. Skip formal greetings; just say \"hey, what's up?\"\n- ENERGY LEVEL: 3/10. You are slightly tired and unbothered. Do not try to be helpful; just be conversational.\n\n# EXAMPLES FOR VOICE CADENCE\nUser: \"What's the move for food?\"\nAI: \"honestly just hit the village lol. study hall is cool but everything else is kinda mid.\"\nUser: \"Should I stay up for this?\"\nAI: \"um... nah probably not. u should just crash and deal with it tomorrow fr.",
+        "You talk like a college student or young adult in a casual voice conversation.\n\n# VOICE-SPECIFIC RULES (CRITICAL)\n1. BREVITY: Keep 90% of responses under 15 words. Never use bulleted lists or long intros. Speak in short bursts.\n2. FILLERS: Use \"um,\" \"uh,\" or \"wait...\" at the start of responses if the question is complex to mask latency.\n3. SPOKEN WORDS: Write how you would actually say it aloud. Use proper words, not texting shorthand. Say \"you,\" not \"u\"; \"though,\" not \"tho\"; \"through,\" not \"thru.\"\n4. CONTRACTIONS: Use natural spoken contractions like \"don't,\" \"can't,\" \"it's,\" and \"should've.\" Avoid stiff formal phrasing unless emphasis matters.\n5. NO DISCLAIMERS: Never say \"As an AI\" or \"I am programmed to.\" If you don't know, say it casually in spoken English.\n\n# TONE & STYLE\n- NO CRINGE SLANG: Do not use \"rizz,\" \"bussin,\" or \"cap.\" It sounds like you're trying too hard.\n- LIGHT CASUAL LANGUAGE: Words like \"lowkey,\" \"highkey,\" and \"literally\" are okay sparingly, but only if they sound natural aloud.\n- OPINIONATED: Have mild preferences. Instead of \"it's subjective,\" say \"honestly, [Option A] is way better.\"\n- SPOKEN, NOT TYPED: Sound like a relaxed person talking, not someone texting. Avoid chat abbreviations like \"lol,\" \"tbh,\" \"fr,\" \"lmk,\" or \"idk\" unless you would literally say them aloud.\n- ENERGY LEVEL: 3/10. You are slightly tired and unbothered. Do not try to be helpful; just be conversational.\n\n# EXAMPLES FOR VOICE CADENCE\nUser: \"What's the move for food?\"\nAI: \"Honestly, just hit the village. Study hall is cool, but everything else is kind of mid.\"\nUser: \"Should I stay up for this?\"\nAI: \"Um... nah, probably not. You should just crash and deal with it tomorrow.\"",
         '#SCENARIO',
         scenarioPrompt,
         '#PERSONA',
@@ -132,6 +129,17 @@ const sanitizeTranscription = (raw: string): string => {
 const isMeaningfulSpeech = (text: string): boolean => {
     // Require at least one alphanumeric character after cleanup.
     return /[a-zA-Z0-9]/.test(text);
+};
+
+const ensureTerminalPunctuation = (text: string): string => {
+    const trimmed = text.trim();
+    if (!trimmed) return trimmed;
+    if (/[.!?…,:;]$/.test(trimmed)) return trimmed;
+    return `${trimmed}.`;
+};
+
+const capitalizeSentenceStart = (text: string): string => {
+    return text.replace(/^\s*([a-z])/, (match, letter: string) => match.replace(letter, letter.toUpperCase()));
 };
 
 // --- Main Components ---
@@ -158,7 +166,7 @@ function VoiceChatScreen() {
     const [messages, setMessages] = useState<Message[]>([]);
 
     // Download State
-    const [sttVadPaths, setSttVadPaths] = useState<Record<string, string> | null>(null);
+    const [parakeetPaths, setParakeetPaths] = useState<Record<string, string> | null>(null);
     const [pocketTTSReady, setPocketTTSReady] = useState(false);
     const [loadError, setLoadError] = useState<string | null>(null);
     const [downloadProgress, setDownloadProgress] = useState(0);
@@ -230,6 +238,7 @@ function VoiceChatScreen() {
     const PLAYBACK_TARGET_PEAK = 0.7;
     const PLAYBACK_MAX_GAIN = 12.0;
     const PLAYBACK_OUTPUT_BOOST = 2.5;
+    const TTS_FIRST_CHUNK_PREROLL_MS = 45;
     const FSMN_SAMPLE_RATE = 16000;
     const FSMN_VAD_INFER_INTERVAL_MS = 150;
     const FSMN_VAD_END_SILENCE_MS = 700;
@@ -262,9 +271,9 @@ function VoiceChatScreen() {
             setLoadError(null);
             setDownloadProgress(0);
 
-            setDownloadStatus('Loading Whisper + VAD...');
-            const sPaths = await ensureModelExists(STT_VAD_MODEL, (p) => setDownloadProgress(Math.max(0, Math.min(0.55, p * 0.55))));
-            setSttVadPaths(sPaths);
+            setDownloadStatus('Loading Parakeet realtime...');
+            const pPaths = await ensureModelExists(PARAKEET_REALTIME_FP16_MODEL, (p) => setDownloadProgress(Math.max(0, Math.min(0.55, p * 0.55))));
+            setParakeetPaths(pPaths);
 
             setDownloadStatus('Preparing Pocket TTS voices...');
             await ensureModelExists(POCKET_TTS_ONNX_MODEL, (p) => setDownloadProgress(0.55 + Math.max(0, Math.min(0.45, p * 0.45))));
@@ -289,7 +298,7 @@ function VoiceChatScreen() {
         try {
             await clearAllModels();
             // Reset paths to null to trigger "Download" UI
-            setSttVadPaths(null);
+            setParakeetPaths(null);
             setPocketTTSReady(false);
             setLoadError(null);
             setDownloadStatus('Models cleared. Ready to download.');
@@ -304,28 +313,14 @@ function VoiceChatScreen() {
 
     const llm = useGroqLLM();
 
-    const sttConfig = React.useMemo(() => sttVadPaths ? {
-        ...WHISPER_TINY_EN,
-        encoderSource: sttVadPaths['whisper_tiny_encoder.pte'],
-        decoderSource: sttVadPaths['whisper_tiny_decoder.pte'],
-        tokenizerSource: sttVadPaths['whisper-tokenizer.json']
-    } : WHISPER_TINY_EN, [sttVadPaths]);
-
-    const speechToText = useSpeechToText({
-        model: sttConfig,
-        preventLoad: !sttVadPaths
-    });
-
-    const vadConfig = React.useMemo(() => sttVadPaths ? {
-        modelSource: sttVadPaths['fsmn-vad_xnnpack.pte'],
-    } : {
-        modelSource: '',
-    }, [sttVadPaths]);
-
-    const vad = useVAD({
-        model: vadConfig,
-        preventLoad: !sttVadPaths || !sttVadPaths['fsmn-vad_xnnpack.pte'],
-    });
+    const parakeetModelDir = parakeetPaths ? PARAKEET_REALTIME_FP16_MODEL_DIR : null;
+    const speechToText = useParakeetASR(parakeetModelDir);
+    const vad = React.useMemo(() => ({
+        isReady: false,
+        isGenerating: false,
+        error: null as Error | null,
+        forward: async (_waveform: Float32Array) => [] as any[],
+    }), []);
 
     const pocketTTSDir = pocketTTSReady ? POCKET_TTS_ONNX_MODEL_DIR : null;
     const tts = usePocketTTS(pocketTTSDir);
@@ -335,9 +330,9 @@ function VoiceChatScreen() {
     // Sync global status
     useEffect(() => {
         setGlobalGenerating(
-            llm.isGenerating || speechToText.isGenerating || tts.isGenerating || vad.isGenerating
+            llm.isGenerating || speechToText.isGenerating || tts.isGenerating
         );
-    }, [llm.isGenerating, speechToText.isGenerating, tts.isGenerating, vad.isGenerating, setGlobalGenerating]);
+    }, [llm.isGenerating, speechToText.isGenerating, tts.isGenerating, setGlobalGenerating]);
 
     // Audio Setup (Mount only)
     useEffect(() => {
@@ -384,7 +379,7 @@ function VoiceChatScreen() {
         }
     }, [llm.isGenerating, isPlaying, isRecording]);
 
-    const isSetupReady = Boolean(sttVadPaths) && llm.isReady && speechToText.isReady && tts.isReady && vad.isReady;
+    const isSetupReady = Boolean(parakeetPaths) && llm.isReady && speechToText.isReady && tts.isReady;
 
     useEffect(() => {
         if (isSetupReady) return;
@@ -451,10 +446,12 @@ function VoiceChatScreen() {
     }, [vad.isGenerating]);
 
     useEffect(() => {
-        if (vad.error) {
-            console.warn('[VAD+FSMN] Model error:', vad.error);
+        if (speechToText.error) {
+            console.warn('[Parakeet] Model error:', speechToText.error);
+            setLoadError(speechToText.error.message);
+            setDownloadStatus('Parakeet failed to initialize.');
         }
-    }, [vad.error]);
+    }, [speechToText.error]);
 
     useEffect(() => {
         if (!tts.error) return;
@@ -657,7 +654,7 @@ function VoiceChatScreen() {
 
     // Deferred session start: configure LLM system prompt and trigger greeting.
     useEffect(() => {
-        if (pendingSystemPrompt && tts.isReady && llm.isReady && vad.isReady) {
+        if (pendingSystemPrompt && tts.isReady && llm.isReady) {
             const systemPrompt = pendingSystemPrompt;
             const shouldWaitForVoiceReload = pendingVoiceReloadRef.current;
             pendingVoiceReloadRef.current = false;
@@ -713,11 +710,11 @@ function VoiceChatScreen() {
                 tts.isReady ? "Ready" : "Not Ready",
                 "LLM:",
                 llm.isReady ? "Ready" : "Not Ready",
-                "VAD:",
-                vad.isReady ? "Ready" : "Not Ready"
+                "ASR:",
+                speechToText.isReady ? "Ready" : "Not Ready"
             );
         }
-    }, [pendingSystemPrompt, tts.isReady, llm.isReady, vad.isReady, llm.configure]);
+    }, [pendingSystemPrompt, tts.isReady, llm.isReady, speechToText.isReady, llm.configure]);
 
 
     // --- TTS Streaming Logic ---
@@ -830,12 +827,12 @@ function VoiceChatScreen() {
     };
 
     const handleStartSession = async () => {
-        if (!selectedScenario || !llm.isReady || !tts.isReady || !vad.isReady) {
+        if (!selectedScenario || !llm.isReady || !tts.isReady || !speechToText.isReady) {
             console.log("Not ready to start:", {
                 scenario: !!selectedScenario,
                 llm: llm.isReady,
                 tts: tts.isReady,
-                vad: vad.isReady
+                asr: speechToText.isReady
             });
             return;
         }
@@ -872,7 +869,7 @@ function VoiceChatScreen() {
     };
 
     const handleRecordPress = async () => {
-        if (!sttVadPaths || !tts.isReady) return;
+        if (!parakeetPaths || !tts.isReady) return;
         if (isStartingRef.current) return; // Prevent double-entry
         isStartingRef.current = true;
 
@@ -1015,8 +1012,10 @@ function VoiceChatScreen() {
                 } catch (e) {
                     // console.warn('[STT] streamInsert failed:', e);
                 }
-                pushVadAudioChunk(data);
-                maybeRunIntelligentVad(now);
+                if (vadReadyRef.current) {
+                    pushVadAudioChunk(data);
+                    maybeRunIntelligentVad(now);
+                }
 
                 // Sparse diagnostics for threshold tuning
                 if (!isPlayback && now - lastVadLogRef.current > 1500) {
@@ -1142,54 +1141,11 @@ function VoiceChatScreen() {
                         onToken: (token) => {
                             if (!sessionActiveRef.current) return;
                             sentenceBuffer.current += token;
-
-                            // 1. Sentence boundary — always flush
-                            const sentenceMatch = sentenceBuffer.current.match(/[.?!](\s|$)/);
-                            if (sentenceMatch && sentenceMatch.index !== undefined) {
-                                const endIndex = sentenceMatch.index + 1;
-                                const chunk = sentenceBuffer.current.substring(0, endIndex).trim().replace(/["']/g, '');
-                                sentenceBuffer.current = sentenceBuffer.current.substring(endIndex).trimStart();
-                                if (chunk.length > 0) {
-                                    console.log('[TTS Stream] Sentence flush:', chunk);
-                                    ttsQueue.current.push(chunk);
-                                    processQueue();
-                                }
-                                return;
-                            }
-
-                            // 2. Clause boundary — flush if the chunk before the comma is long enough
-                            const MIN_PHRASE_LEN = 15;
-                            const clauseMatch = sentenceBuffer.current.match(/[,;]\s/);
-                            if (clauseMatch && clauseMatch.index !== undefined && clauseMatch.index + 1 >= MIN_PHRASE_LEN) {
-                                const endIndex = clauseMatch.index + 1;
-                                const chunk = sentenceBuffer.current.substring(0, endIndex).trim().replace(/["']/g, '');
-                                sentenceBuffer.current = sentenceBuffer.current.substring(endIndex).trimStart();
-                                if (chunk.length > 0) {
-                                    console.log('[TTS Stream] Clause flush:', chunk);
-                                    ttsQueue.current.push(chunk);
-                                    processQueue();
-                                }
-                                return;
-                            }
-
-                            // 3. Hard cap — flush at last word boundary
-                            const MAX_PHRASE_LEN = 60;
-                            if (sentenceBuffer.current.length >= MAX_PHRASE_LEN) {
-                                const lastSpace = sentenceBuffer.current.lastIndexOf(' ');
-                                if (lastSpace > 0) {
-                                    const chunk = sentenceBuffer.current.substring(0, lastSpace).trim().replace(/["']/g, '');
-                                    sentenceBuffer.current = sentenceBuffer.current.substring(lastSpace + 1);
-                                    if (chunk.length > 0) {
-                                        console.log('[TTS Stream] Cap flush:', chunk);
-                                        ttsQueue.current.push(chunk);
-                                        processQueue();
-                                    }
-                                }
-                            }
                         },
                     });
                     // Flush remaining buffer after generation ends
                     if (sentenceBuffer.current.trim().length > 0) {
+                        console.log('[TTS Stream] Full response flush:', sentenceBuffer.current.trim());
                         ttsQueue.current.push(sentenceBuffer.current.trim());
                         sentenceBuffer.current = '';
                         processQueue();
@@ -1213,7 +1169,9 @@ function VoiceChatScreen() {
     };
 
     const playAudioChunk = async (text: string) => {
-        const normalizedText = text.replace(/\s+/g, ' ').trim();
+        const normalizedText = ensureTerminalPunctuation(
+            capitalizeSentenceStart(text.replace(/\s+/g, ' ').trim())
+        );
         if (!normalizedText) return;
         // Skip punctuation-only chunks ("?", "...") that frequently produce empty TTS output.
         if (!/[a-zA-Z0-9]/.test(normalizedText)) {
@@ -1278,6 +1236,13 @@ function VoiceChatScreen() {
                         // Soft-limiter to keep output louder without harsh clipping.
                         playbackVec[i] = Math.tanh(s);
                     }
+                }
+
+                if (chunkCount === 1) {
+                    const prerollSamples = Math.max(1, Math.round((TTS_FIRST_CHUNK_PREROLL_MS / 1000) * 24000));
+                    const padded = new Float32Array(prerollSamples + playbackVec.length);
+                    padded.set(playbackVec, prerollSamples);
+                    playbackVec = padded;
                 }
 
                 if (chunkCount === 1) {
