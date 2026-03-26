@@ -83,7 +83,9 @@
           }
         }
       ],
-      "onnxruntime-react-native"
+      "onnxruntime-react-native",
+      "@cloudflare/realtimekit-react-native",
+      "@cloudflare/react-native-webrtc"
     ],
     "experiments": {
       "typedRoutes": true,

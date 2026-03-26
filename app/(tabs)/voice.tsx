@@ -26,6 +26,12 @@ import {
 import { useParakeetASR } from '../../hooks/useParakeetASR';
 import { useGroqLLM } from '../../hooks/useGroqLLM';
 import { usePocketTTS } from '../../hooks/usePocketTTS';
+import { CloudflareSubscriberMeeting } from '../../components/CloudflareSubscriberMeeting';
+import {
+    AvatarSessionClient,
+    createAvatarSession,
+    type AvatarSessionResponse,
+} from '../../services/avatarSession';
 
 const { width } = Dimensions.get('window');
 
@@ -144,13 +150,25 @@ const capitalizeSentenceStart = (text: string): string => {
 
 // --- Main Components ---
 
-export default function VoiceChatScreenWrapper() {
+export type PracticeExperience = 'voice' | 'video';
+
+export function PracticeChatScreenWrapper({
+    experience = 'voice',
+}: {
+    experience?: PracticeExperience;
+}) {
     const isFocused = useIsFocused();
-    return isFocused ? <VoiceChatScreen /> : null;
+    return isFocused ? <VoiceChatScreen experience={experience} /> : null;
 }
 
-function VoiceChatScreen() {
+export default function VoiceChatScreenWrapper() {
+    return <PracticeChatScreenWrapper experience="voice" />;
+}
+
+function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperience }) {
     const { setGlobalGenerating } = useContext(GeneratingContext);
+    const isVideoExperience = experience === 'video';
+    const controlPlaneUrl = process.env.EXPO_PUBLIC_CONTROL_PLANE_URL?.trim() ?? '';
 
     // --- State ---
     const [isRecording, setIsRecording] = useState(false);
@@ -164,6 +182,9 @@ function VoiceChatScreen() {
     const [selectedScenario, setSelectedScenario] = useState<Scenario | null>(null);
     const [pendingSystemPrompt, setPendingSystemPrompt] = useState<string | null>(null);
     const [messages, setMessages] = useState<Message[]>([]);
+    const [remoteSession, setRemoteSession] = useState<AvatarSessionResponse | null>(null);
+    const [remoteRtcConnected, setRemoteRtcConnected] = useState(false);
+    const [videoSessionError, setVideoSessionError] = useState<string | null>(null);
 
     // Download State
     const [parakeetPaths, setParakeetPaths] = useState<Record<string, string> | null>(null);
@@ -228,6 +249,7 @@ function VoiceChatScreen() {
     const vadHasSpeechRef = useRef<boolean>(false);
     const vadBusyRef = useRef<boolean>(false);
     const hasAutoLoadTriggeredRef = useRef<boolean>(false);
+    const avatarSessionClientRef = useRef<AvatarSessionClient | null>(null);
 
     const BARGE_IN_MIN_MS = 300;
     const BARGE_IN_COOLDOWN_MS = 250;
@@ -245,6 +267,22 @@ function VoiceChatScreen() {
     const FSMN_VAD_MIN_SEGMENT_MS = 250;
     const FSMN_VAD_MIN_WAVEFORM_SAMPLES = 3200;
     const FSMN_VAD_MAX_WINDOW_SECONDS = 12;
+
+    const cleanupRemoteSession = React.useCallback(async () => {
+        const client = avatarSessionClientRef.current;
+        avatarSessionClientRef.current = null;
+        setRemoteRtcConnected(false);
+        setRemoteSession(null);
+        if (client) {
+            await client.stop().catch(() => undefined);
+        }
+    }, []);
+    const handleRemoteRtcConnected = React.useCallback((value: boolean) => {
+        setRemoteRtcConnected(value);
+    }, []);
+    const handleRemoteRtcError = React.useCallback((message: string) => {
+        setVideoSessionError(message);
+    }, []);
 
     // Animation
     const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -352,10 +390,11 @@ function VoiceChatScreen() {
             console.log('[Audio] Cleanup...');
             isMountedRef.current = false;
             handleStop();
+            void cleanupRemoteSession();
             audioContextRef.current?.close();
             audioContextRef.current = null;
         };
-    }, []);
+    }, [cleanupRemoteSession]);
 
     // 4. Orb Animation (Pulse)
     useEffect(() => {
@@ -778,6 +817,8 @@ function VoiceChatScreen() {
         resetIntelligentVadState();
         silenceStartRef.current = null;
         isSpeakingRef.current = false;
+        setVideoSessionError(null);
+        void cleanupRemoteSession();
 
         // Explicitly stop recorder cleanup (since we keep it running now)
         try {
@@ -844,12 +885,50 @@ function VoiceChatScreen() {
             p.description
         );
 
+        if (isVideoExperience && controlPlaneUrl) {
+            setVideoSessionError(null);
+            try {
+                console.log('[Avatar Session] controlPlaneUrl=', controlPlaneUrl);
+                console.log('[Avatar Session] creating control-plane session...');
+                const created = await createAvatarSession(controlPlaneUrl, {
+                    avatarId: p.gender === 'female' ? 'default-female' : 'default-male',
+                    gender: p.gender,
+                });
+                console.log('[Avatar Session] control-plane session created', created);
+
+                const client = new AvatarSessionClient(created, {
+                    onError: (message) => {
+                        console.error('[Avatar Session] Worker error:', message);
+                        setVideoSessionError(message);
+                    },
+                    onStopped: () => {
+                        setRemoteRtcConnected(false);
+                    },
+                });
+                console.log('[Avatar Session] connecting worker websocket...', created.workerWsUrl);
+                await client.connect();
+                console.log('[Avatar Session] worker websocket connected');
+                avatarSessionClientRef.current = client;
+                setRemoteSession(created);
+                console.log('[Avatar Session] remote session created', created);
+            } catch (e) {
+                const message = e instanceof Error ? e.message : String(e);
+                console.error('[Avatar Session] Failed to start remote session:', e);
+                setVideoSessionError(message);
+                setLoadError(`Video session failed: ${message}`);
+                return;
+            }
+        } else if (isVideoExperience && !controlPlaneUrl) {
+            console.warn('[Avatar Session] EXPO_PUBLIC_CONTROL_PLANE_URL is not set; video tab will stay local-only.');
+        }
+
         try {
             const primedVoice = await tts.primeVoice(p.gender);
             console.log(`[TTS] Primed voice '${primedVoice}' for persona gender='${p.gender}'`);
         } catch (e) {
             console.error('[TTS] Failed to prime selected voice:', e);
             setLoadError(`Voice priming failed: ${e instanceof Error ? e.message : String(e)}`);
+            void cleanupRemoteSession();
             return;
         }
 
@@ -1299,7 +1378,19 @@ function VoiceChatScreen() {
 
             const onNext = async (audioVec: Float32Array) => {
                 chunkCount++;
-                scheduleAudioVector(audioVec);
+                if (isVideoExperience && avatarSessionClientRef.current?.isReady()) {
+                    try {
+                        await avatarSessionClientRef.current.appendFloat32Chunk(audioVec, 24000, 1);
+                    } catch (error) {
+                        const message = error instanceof Error ? error.message : String(error);
+                        console.error('[Avatar Session] Failed to forward TTS chunk:', error);
+                        setVideoSessionError(message);
+                    }
+                }
+
+                if (!(isVideoExperience && remoteRtcConnected)) {
+                    scheduleAudioVector(audioVec);
+                }
                 maybeStartAmbientListener();
             };
 
@@ -1360,6 +1451,10 @@ function VoiceChatScreen() {
             if (streamError) {
                 throw streamError;
             }
+
+            if (isVideoExperience) {
+                avatarSessionClientRef.current?.signalAudioEnd();
+            }
         } catch (error) {
             console.error('TTS Error:', error);
             setIsPlaying(false);
@@ -1394,7 +1489,9 @@ function VoiceChatScreen() {
                 </Animated.View>
                 <Animated.View style={[styles.loaderCore, { transform: [{ scale: coreScale }], opacity: coreOpacity }]} />
 
-                <Text style={styles.loaderTitle}>Launching Voice Engine</Text>
+                        <Text style={styles.loaderTitle}>
+                            {isVideoExperience ? 'Launching Video Engine' : 'Launching Voice Engine'}
+                        </Text>
                 <Text style={styles.loaderSubtitle}>{downloadStatus}</Text>
 
                 <View style={styles.loaderProgressTrack}>
@@ -1425,8 +1522,8 @@ function VoiceChatScreen() {
                 <View style={styles.header}>
                     <Text style={styles.headerTitle}>
                         {sessionActive
-                            ? SCENARIOS.find(s => s.id === selectedScenario)?.label || 'Voice Chat'
-                            : 'Practice Mode'}
+                            ? SCENARIOS.find(s => s.id === selectedScenario)?.label || (isVideoExperience ? 'Video Call' : 'Voice Chat')
+                            : (isVideoExperience ? 'Video Practice' : 'Practice Mode')}
                     </Text>
                     {sessionActive && (
                         <TouchableOpacity onPress={handleEndSession}>
@@ -1466,35 +1563,88 @@ function VoiceChatScreen() {
                             disabled={!selectedScenario}
                             onPress={handleStartSession}
                         >
-                            <Text style={styles.startText}>Start Conversation</Text>
+                            <Text style={styles.startText}>
+                                {isVideoExperience ? 'Start Video Call' : 'Start Conversation'}
+                            </Text>
                         </TouchableOpacity>
                     </View>
                 ) : (
-                    // 2. Active Voice Session (The Orb)
-                    <View style={styles.orbContainer}>
-                        <Animated.View style={[
-                            styles.orb,
-                            {
-                                transform: [{ scale: pulseAnim }],
-                                opacity: pulseAnim.interpolate({
-                                    inputRange: [1, 1.2],
-                                    outputRange: [0.8, 1]
-                                })
-                            }
-                        ]}>
-                            <View style={styles.orbInner} />
-                        </Animated.View>
+                    isVideoExperience ? (
+                        <View style={styles.videoSessionContainer}>
+                            <View style={styles.videoStage}>
+                                <View style={styles.videoStageHeader}>
+                                    <Text style={styles.videoStageTitle}>Avatar Call</Text>
+                                    <View style={styles.videoStageStatus}>
+                                        <View style={styles.videoStageStatusDot} />
+                                        <Text style={styles.videoStageStatusText}>
+                                            {activeSourcesRef.current > 0 || isPlaying
+                                                ? 'Speaking'
+                                                : (isRecording
+                                                    ? 'Listening'
+                                                    : (llm.isGenerating ? 'Thinking' : 'Live'))}
+                                        </Text>
+                                    </View>
+                                </View>
 
-                        <Text style={styles.statusText}>
-                            {activeSourcesRef.current > 0 || isPlaying
-                                ? 'Speaking...'
-                                : (isRecording
-                                    ? 'Listening...'
-                                    : (llm.isGenerating ? 'Thinking...' : '...'))}
-                        </Text>
-                        {/* We can hide the raw transcription or show it simply */}
-                        {isRecording && <Text style={styles.transcriptionPreview}>...</Text>}
-                    </View>
+                                <View style={styles.videoStageCanvas}>
+                                    <CloudflareSubscriberMeeting
+                                        credentials={remoteSession?.rtcCredentials ?? null}
+                                        onConnectedChange={handleRemoteRtcConnected}
+                                        onError={handleRemoteRtcError}
+                                    />
+
+                                    <View style={styles.videoStageOverlay}>
+                                        <Text style={styles.videoStageOverlayLabel}>
+                                            {selectedScenario ? SCENARIOS.find(s => s.id === selectedScenario)?.label || 'Video Call' : 'Video Call'}
+                                        </Text>
+                                        <Text style={styles.videoStageOverlaySubLabel}>
+                                            {remoteSession
+                                                ? (remoteRtcConnected
+                                                    ? 'Subscriber joined. Avatar audio/video will return from Cloudflare only.'
+                                                    : 'Connecting subscriber session and worker bridge...')
+                                                : 'Voice agent loop active, video stream will attach when the backend session starts.'}
+                                        </Text>
+                                    </View>
+                                </View>
+                            </View>
+
+                            <Text style={styles.statusText}>
+                                {activeSourcesRef.current > 0 || isPlaying
+                                    ? 'Speaking...'
+                                    : (isRecording
+                                        ? 'Listening...'
+                                        : (llm.isGenerating ? 'Thinking...' : 'Waiting...'))}
+                            </Text>
+                            {videoSessionError && (
+                                <Text style={styles.transcriptionPreview}>{videoSessionError}</Text>
+                            )}
+                            {isRecording && <Text style={styles.transcriptionPreview}>...</Text>}
+                        </View>
+                    ) : (
+                        <View style={styles.orbContainer}>
+                            <Animated.View style={[
+                                styles.orb,
+                                {
+                                    transform: [{ scale: pulseAnim }],
+                                    opacity: pulseAnim.interpolate({
+                                        inputRange: [1, 1.2],
+                                        outputRange: [0.8, 1]
+                                    })
+                                }
+                            ]}>
+                                <View style={styles.orbInner} />
+                            </Animated.View>
+
+                            <Text style={styles.statusText}>
+                                {activeSourcesRef.current > 0 || isPlaying
+                                    ? 'Speaking...'
+                                    : (isRecording
+                                        ? 'Listening...'
+                                        : (llm.isGenerating ? 'Thinking...' : '...'))}
+                            </Text>
+                            {isRecording && <Text style={styles.transcriptionPreview}>...</Text>}
+                        </View>
+                    )
                 )}
 
                 {/* Bottom Controls (Only in Active Mode) */}
@@ -1716,6 +1866,90 @@ const styles = StyleSheet.create({
         justifyContent: 'center',
         alignItems: 'center',
         marginBottom: 60,
+    },
+    videoSessionContainer: {
+        flex: 1,
+        justifyContent: 'center',
+        alignItems: 'center',
+        paddingHorizontal: 20,
+        marginBottom: 28,
+    },
+    videoStage: {
+        width: '100%',
+        maxWidth: 420,
+        borderRadius: 28,
+        backgroundColor: '#08111f',
+        overflow: 'hidden',
+        borderWidth: 1,
+        borderColor: '#16324f',
+        shadowColor: '#04111d',
+        shadowOffset: { width: 0, height: 16 },
+        shadowOpacity: 0.24,
+        shadowRadius: 24,
+        elevation: 12,
+    },
+    videoStageHeader: {
+        paddingHorizontal: 18,
+        paddingVertical: 14,
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        borderBottomWidth: 1,
+        borderBottomColor: 'rgba(127, 210, 255, 0.12)',
+    },
+    videoStageTitle: {
+        color: '#f3f8ff',
+        fontSize: 16,
+        fontWeight: '700',
+    },
+    videoStageStatus: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 8,
+    },
+    videoStageStatusDot: {
+        width: 10,
+        height: 10,
+        borderRadius: 999,
+        backgroundColor: '#57e389',
+    },
+    videoStageStatusText: {
+        color: '#a9bfd8',
+        fontSize: 13,
+        fontWeight: '600',
+    },
+    videoStageCanvas: {
+        minHeight: 440,
+        justifyContent: 'center',
+        alignItems: 'center',
+        backgroundColor: '#0b1625',
+    },
+    videoStageOverlay: {
+        position: 'absolute',
+        left: 18,
+        right: 18,
+        bottom: 18,
+        paddingHorizontal: 14,
+        paddingVertical: 12,
+        borderRadius: 18,
+        backgroundColor: 'rgba(4, 11, 18, 0.56)',
+    },
+    videoStageOverlayLabel: {
+        color: '#f4fbff',
+        fontSize: 16,
+        fontWeight: '700',
+    },
+    videoStageOverlaySubLabel: {
+        marginTop: 4,
+        color: '#abc4de',
+        fontSize: 13,
+        lineHeight: 18,
+    },
+    videoOrb: {
+        width: 240,
+        height: 240,
+        borderRadius: 120,
+        backgroundColor: 'rgba(80, 156, 255, 0.24)',
     },
     orb: {
         width: 200,

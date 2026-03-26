@@ -1,0 +1,37 @@
+{
+  "name": "coherent-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev:control": "tsx watch src/control-plane/main.ts",
+    "dev:cf-control": "wrangler dev src/cloudflare-control-plane/index.ts --config src/cloudflare-control-plane/wrangler.jsonc",
+    "dev:worker": "tsx watch src/worker/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "deploy:cf-control": "wrangler deploy --config src/cloudflare-control-plane/wrangler.jsonc",
+    "test:bridge": "node scripts/test_bridge.mjs",
+    "test:bridge:direct": "python3 scripts/test_soulx_stream_bridge.py",
+    "test:session": "bash scripts/test_session.sh",
+    "start:control": "node dist/control-plane/main.js",
+    "start:worker": "node dist/worker/main.js",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@cloudflare/realtimekit": "^1.2.5",
+    "@fastify/cors": "^10.1.0",
+    "@fastify/websocket": "^11.2.0",
+    "fastify": "^5.6.1",
+    "pg": "^8.16.3",
+    "playwright-core": "^1.58.2",
+    "uuid": "^13.0.0",
+    "zod": "^4.1.11"
+  },
+  "devDependencies": {
+    "@types/node": "^24.7.2",
+    "@types/pg": "^8.15.5",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4",
+    "wrangler": "^4.76.0"
+  }
+}

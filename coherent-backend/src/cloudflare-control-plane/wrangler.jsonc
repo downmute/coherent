@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "coherent-control-plane",
+  "main": "index.ts",
+  "compatibility_date": "2026-03-23",
+  "observability": {
+    "enabled": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "coherent-control-plane",
+      "database_id": "adcbfbe6-6296-4083-9c31-a7ef3d2003fe"
+    }
+  ],
+  "vars": {
+    "RTC_PROVIDER": "cloudflare",
+    "RTC_ENDPOINT": "https://realtime.cloudflare.com",
+    "CLOUDFLARE_API_BASE_URL": "https://api.cloudflare.com/client/v4",
+    "CLOUDFLARE_SUBSCRIBER_PRESET": "group_call_participant",
+    "CLOUDFLARE_PUBLISHER_PRESET": "group_call_host",
+    "SIMPLEPOD_API_BASE_URL": "",
+    "SIMPLEPOD_TEMPLATE_ID": "",
+    "SIMPLEPOD_GPU_MODEL": "RTX4090",
+    "SIMPLEPOD_REGION": "",
+    "SIMPLEPOD_PROVISION_PATH": "/instances",
+    "SESSION_PROVISION_TIMEOUT_MS": "30000",
+    "SESSION_PROVISION_POLL_MS": "2000"
+  }
+}

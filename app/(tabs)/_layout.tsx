@@ -34,6 +34,16 @@ export default function TabLayout() {
                     ),
                 }}
             />
+
+            <Tabs.Screen
+                name="video"
+                options={{
+                    title: "Video",
+                    tabBarIcon: ({ color, size }) => (
+                        <Ionicons name="videocam-outline" size={size} color={color} />
+                    ),
+                }}
+            />
         </Tabs>
     );
 }
