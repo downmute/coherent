@@ -1,0 +1,67 @@
+version: "2.0"
+
+services:
+  worker:
+    image: YOUR_REGISTRY/coherent-backend-worker:TAG
+    env:
+      - WORKER_PORT=8090
+      - WORKER_HOST=0.0.0.0
+      - WORKER_KEY=akash-worker-1
+      - WORKER_PROVIDER=akash
+      - WORKER_PROVIDER_INSTANCE_ID=
+      - WORKER_REGION=us-west
+      - WORKER_GPU_MODEL=RTX4090
+      - WORKER_MAX_SESSIONS=1
+      - WORKER_PUBLIC_WS_URL=wss://YOUR_AKASH_HOST/ws
+      - WORKER_HEARTBEAT_MS=10000
+      - CONTROL_PLANE_URL=https://coherent-control-plane.abot011235.workers.dev
+      - WORKER_TOKEN_SECRET=CHANGE_ME
+      - RTC_PROVIDER=cloudflare
+      - RTC_ENDPOINT=https://realtime.cloudflare.com
+      - CLOUDFLARE_ACCOUNT_ID=CHANGE_ME
+      - CLOUDFLARE_REALTIME_APP_ID=CHANGE_ME
+      - CLOUDFLARE_API_TOKEN=CHANGE_ME
+      - CLOUDFLARE_SUBSCRIBER_PRESET=group_call_participant
+      - CLOUDFLARE_PUBLISHER_PRESET=group_call_host
+      - WORKER_RTC_PUBLISHER=mock
+      - SOULX_RUNTIME_MODE=mock
+    expose:
+      - port: 8090
+        as: 80
+        proto: tcp
+        # If you have a custom domain, uncomment accept and point DNS there.
+        # accept:
+        #   - worker.example.com
+        to:
+          - global: true
+
+profiles:
+  compute:
+    worker:
+      resources:
+        cpu:
+          units: 4.0
+        memory:
+          size: 16Gi
+        storage:
+          - size: 30Gi
+        gpu:
+          units: "1"
+          attributes:
+            vendor:
+              nvidia:
+                - model: rtx4090
+  placement:
+    akash:
+      attributes:
+        region: us-west
+      pricing:
+        worker:
+          denom: uakt
+          amount: "10000"
+
+deployment:
+  worker:
+    akash:
+      profile: worker
+      count: 1

@@ -10,7 +10,7 @@
     {
       "binding": "DB",
       "database_name": "coherent-control-plane",
-      "database_id": "adcbfbe6-6296-4083-9c31-a7ef3d2003fe"
+      "database_id": "18a5f2a6-9232-4c45-88ca-70010aa7bed1"
     }
   ],
   "vars": {
@@ -24,6 +24,15 @@
     "SIMPLEPOD_GPU_MODEL": "RTX4090",
     "SIMPLEPOD_REGION": "",
     "SIMPLEPOD_PROVISION_PATH": "/instances",
+    "SIMPLEPOD_ALLOWED_CUDA_VERSIONS": "",
+    "RUNPOD_API_BASE_URL": "https://rest.runpod.io/v1",
+    "RUNPOD_TEMPLATE_ID": "e3j3ft3qbz",
+    "RUNPOD_GPU_TYPE_IDS": "NVIDIA GeForce RTX 4090",
+    "RUNPOD_CLOUD_TYPE": "SECURE",
+    "RUNPOD_ALLOWED_CUDA_VERSIONS": "12.8",
+    "RUNPOD_DATA_CENTER_IDS": "",
+    "RUNPOD_COUNTRY_CODES": "",
+    "RUNPOD_NAME_PREFIX": "coherent-worker",
     "SESSION_PROVISION_TIMEOUT_MS": "30000",
     "SESSION_PROVISION_POLL_MS": "2000"
   }

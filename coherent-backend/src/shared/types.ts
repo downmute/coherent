@@ -143,6 +143,14 @@ export type WorkerToClientMessage =
       estimatedFrames: number;
     }
   | {
+      type: 'video.segment';
+      sessionId: string;
+      segmentIndex: number;
+      url: string;
+      final: boolean;
+      durationSeconds?: number;
+    }
+  | {
       type: 'heartbeat.ack';
       sessionId: string;
       active: boolean;

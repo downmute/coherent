@@ -287,6 +287,29 @@ Recommended SimplePod validation path:
    - `SOULX_INFERENCE_COMMAND` to the exact repo command you want to validate
 3. Start the container and confirm the official repo runs on your chosen GPU image
 
+If you provision those workers through the control plane, you can also constrain
+host placement by CUDA driver compatibility with:
+
+```dotenv
+SIMPLEPOD_ALLOWED_CUDA_VERSIONS=12.8
+```
+
+The control plane forwards that as `allowedCudaVersions` in the provider create
+request, which is useful on Runpod when you want to keep a `cu128`-tuned image.
+
+For the direct Runpod control-plane path, configure:
+
+```dotenv
+RUNPOD_API_BASE_URL=https://rest.runpod.io/v1
+RUNPOD_TEMPLATE_ID=e3j3ft3qbz
+RUNPOD_GPU_TYPE_IDS=NVIDIA GeForce RTX 4090
+RUNPOD_CLOUD_TYPE=SECURE
+RUNPOD_ALLOWED_CUDA_VERSIONS=12.8
+RUNPOD_NAME_PREFIX=coherent-worker
+```
+
+and set `RUNPOD_API_KEY` as a secret on the deployed control plane.
+
 Example SimplePod env block for validating the official `generate_video.py` flow:
 
 ```dotenv

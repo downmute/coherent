@@ -211,12 +211,84 @@ class BrowserRtcPublisher implements RtcPublisher {
         const frameQueue: string[] = [];
         const maxQueuedFrames = Math.max(8, fps * 2);
         let framePumpStarted = false;
+        let hasRenderedEncodedFrame = false;
+        let rtcAudioUnlocked = false;
+        const pendingAudioChunks: Array<{
+          base64: string;
+          sampleRate: number;
+          channels: number;
+          format: string;
+        }> = [];
+
+        const schedulePcmBase64 = (base64: string, sampleRate: number, channels: number, format: string) => {
+          const binary = atob(base64);
+          const bytes = new Uint8Array(binary.length);
+          for (let index = 0; index < binary.length; index += 1) {
+            bytes[index] = binary.charCodeAt(index);
+          }
+
+          let frameCount = 0;
+          if (format === 'f32le') {
+            frameCount = Math.floor(bytes.byteLength / 4 / channels);
+          } else {
+            frameCount = Math.floor(bytes.byteLength / 2 / channels);
+          }
+
+          const audioBuffer = audioContext.createBuffer(channels, frameCount, sampleRate);
+          const dataView = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+          for (let channel = 0; channel < channels; channel += 1) {
+            const channelData = audioBuffer.getChannelData(channel);
+            for (let frame = 0; frame < frameCount; frame += 1) {
+              const sampleIndex = frame * channels + channel;
+              if (format === 'f32le') {
+                channelData[frame] = dataView.getFloat32(sampleIndex * 4, true);
+              } else {
+                channelData[frame] = dataView.getInt16(sampleIndex * 2, true) / 32768;
+              }
+            }
+          }
+
+          const source = audioContext.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(destination);
+          const startAt = Math.max(nextAudioTime, audioContext.currentTime + 0.01);
+          source.start(startAt);
+          nextAudioTime = startAt + audioBuffer.duration;
+
+          let rms = 0;
+          const firstChannel = audioBuffer.getChannelData(0);
+          for (let index = 0; index < firstChannel.length; index += 1) {
+            rms += firstChannel[index]! * firstChannel[index]!;
+          }
+          rms = Math.sqrt(rms / Math.max(1, firstChannel.length));
+          if (!hasRenderedEncodedFrame) {
+            tick += 1;
+            drawFrame(24 + rms * 160, tick);
+          }
+        };
+
+        const unlockRtcAudio = () => {
+          if (rtcAudioUnlocked) {
+            return;
+          }
+          rtcAudioUnlocked = true;
+          nextAudioTime = Math.max(nextAudioTime, audioContext.currentTime + 0.03);
+          while (pendingAudioChunks.length > 0) {
+            const chunk = pendingAudioChunks.shift();
+            if (!chunk) {
+              break;
+            }
+            schedulePcmBase64(chunk.base64, chunk.sampleRate, chunk.channels, chunk.format);
+          }
+        };
 
         const drawEncodedFrame = (dataUrl: string) => {
           const image = new Image();
           image.onload = () => {
+            hasRenderedEncodedFrame = true;
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+            unlockRtcAudio();
           };
           image.src = dataUrl;
         };
@@ -240,48 +312,11 @@ class BrowserRtcPublisher implements RtcPublisher {
 
         (globalThis as Record<string, unknown>).__rtcPublisher = {
           async pushPcmBase64(base64: string, sampleRate: number, channels: number, format: string) {
-            const binary = atob(base64);
-            const bytes = new Uint8Array(binary.length);
-            for (let index = 0; index < binary.length; index += 1) {
-              bytes[index] = binary.charCodeAt(index);
+            if (!rtcAudioUnlocked) {
+              pendingAudioChunks.push({ base64, sampleRate, channels, format });
+              return;
             }
-
-            let frameCount = 0;
-            if (format === 'f32le') {
-              frameCount = Math.floor(bytes.byteLength / 4 / channels);
-            } else {
-              frameCount = Math.floor(bytes.byteLength / 2 / channels);
-            }
-
-            const audioBuffer = audioContext.createBuffer(channels, frameCount, sampleRate);
-            const dataView = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-            for (let channel = 0; channel < channels; channel += 1) {
-              const channelData = audioBuffer.getChannelData(channel);
-              for (let frame = 0; frame < frameCount; frame += 1) {
-                const sampleIndex = frame * channels + channel;
-                if (format === 'f32le') {
-                  channelData[frame] = dataView.getFloat32(sampleIndex * 4, true);
-                } else {
-                  channelData[frame] = dataView.getInt16(sampleIndex * 2, true) / 32768;
-                }
-              }
-            }
-
-            const source = audioContext.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(destination);
-            const startAt = Math.max(nextAudioTime, audioContext.currentTime + 0.01);
-            source.start(startAt);
-            nextAudioTime = startAt + audioBuffer.duration;
-
-            let rms = 0;
-            const firstChannel = audioBuffer.getChannelData(0);
-            for (let index = 0; index < firstChannel.length; index += 1) {
-              rms += firstChannel[index]! * firstChannel[index]!;
-            }
-            rms = Math.sqrt(rms / Math.max(1, firstChannel.length));
-            tick += 1;
-            drawFrame(24 + rms * 160, tick);
+            schedulePcmBase64(base64, sampleRate, channels, format);
           },
           pushEncodedFrames(frames: string[]) {
             ensureFramePump();
@@ -293,12 +328,16 @@ class BrowserRtcPublisher implements RtcPublisher {
             }
           },
           pulsePlaceholder(count: number) {
+            if (hasRenderedEncodedFrame) {
+              return;
+            }
             for (let index = 0; index < count; index += 1) {
               tick += 1;
               drawFrame(20 + ((tick % 7) + 1) * 4, tick);
             }
           },
           async close() {
+            pendingAudioChunks.length = 0;
             await meeting.leave();
             await audioContext.close();
           },

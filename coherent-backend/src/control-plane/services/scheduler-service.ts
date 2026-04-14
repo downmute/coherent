@@ -8,7 +8,7 @@ import type {
   WorkerTokenPayload,
 } from '../../shared/types.js';
 import { PostgresStore } from '../db/postgres-store.js';
-import { SimplePodAdapter } from '../adapters/simplepod.js';
+import type { WorkerProvisioner } from '../adapters/provider.js';
 import { RtcCredentialService } from '../adapters/rtc.js';
 
 function sleep(ms: number): Promise<void> {
@@ -19,7 +19,7 @@ export class SchedulerService {
   constructor(
     private readonly store: PostgresStore,
     private readonly rtc: RtcCredentialService,
-    private readonly provider: SimplePodAdapter,
+    private readonly provider: WorkerProvisioner,
     private readonly config: ControlPlaneConfig,
   ) {}
 
@@ -34,7 +34,7 @@ export class SchedulerService {
 
       if (!provision) {
         throw new NoCapacityError(
-          'No warm worker is available and SimplePod provisioning is not configured.',
+          'No warm worker is available and on-demand worker provisioning is not configured.',
         );
       }
 

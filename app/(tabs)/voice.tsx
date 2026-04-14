@@ -14,7 +14,7 @@ import { GeneratingContext } from '../../context/GeneratingContext';
 
 // Libraries
 import { useIsFocused } from '@react-navigation/native';
-import { AudioBuffer, AudioBufferSourceNode, AudioContext, AudioManager, AudioRecorder } from 'react-native-audio-api';
+import { AudioContext, AudioManager, AudioRecorder } from 'react-native-audio-api';
 import {
     clearAllModels,
     ensureModelExists,
@@ -26,11 +26,14 @@ import {
 import { useParakeetASR } from '../../hooks/useParakeetASR';
 import { useGroqLLM } from '../../hooks/useGroqLLM';
 import { usePocketTTS } from '../../hooks/usePocketTTS';
-import { CloudflareSubscriberMeeting } from '../../components/CloudflareSubscriberMeeting';
+import { SoulxSegmentPlayer } from '../../components/SoulxSegmentPlayer';
+import { StreamedAudioPlayer } from '../../services/StreamedAudioPlayer';
 import {
+    AvatarSessionError,
     AvatarSessionClient,
     createAvatarSession,
     type AvatarSessionResponse,
+    type AvatarVideoSegment,
 } from '../../services/avatarSession';
 
 const { width } = Dimensions.get('window');
@@ -94,24 +97,6 @@ const getRandomPersona = (scenarioId: Scenario) => {
 
 // --- Helper Functions ---
 
-const createAudioBufferFromVector = (
-    audioVector: Float32Array,
-    audioContext: AudioContext | null = null,
-    sampleRate: number = 24000
-): AudioBuffer => {
-    if (audioContext == null) audioContext = new AudioContext({ sampleRate });
-
-    const audioBuffer = audioContext.createBuffer(
-        1,
-        audioVector.length,
-        sampleRate
-    );
-    const channelData = audioBuffer.getChannelData(0);
-    channelData.set(audioVector);
-
-    return audioBuffer;
-};
-
 const buildSystemPrompt = (scenarioPrompt: string, personaDescription: string) => {
     return [
         '#ROLE',
@@ -146,6 +131,23 @@ const ensureTerminalPunctuation = (text: string): string => {
 
 const capitalizeSentenceStart = (text: string): string => {
     return text.replace(/^\s*([a-z])/, (match, letter: string) => match.replace(letter, letter.toUpperCase()));
+};
+
+const isNoCapacitySessionError = (error: unknown): boolean => {
+    if (error instanceof AvatarSessionError) {
+        return error.code === 'no_capacity' || error.code === 'provisioning_timeout';
+    }
+    if (!(error instanceof Error)) {
+        return false;
+    }
+    return /no warm worker|no warm gpu worker|provisioning.*ready in time/i.test(error.message);
+};
+
+const getFriendlyVideoSessionError = (error: unknown): string => {
+    if (isNoCapacitySessionError(error)) {
+        return 'Avatar video is temporarily unavailable because no warm GPU worker is registered. Continuing with local audio for now.';
+    }
+    return error instanceof Error ? error.message : String(error);
 };
 
 // --- Main Components ---
@@ -184,6 +186,7 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
     const [messages, setMessages] = useState<Message[]>([]);
     const [remoteSession, setRemoteSession] = useState<AvatarSessionResponse | null>(null);
     const [remoteRtcConnected, setRemoteRtcConnected] = useState(false);
+    const [videoSegments, setVideoSegments] = useState<AvatarVideoSegment[]>([]);
     const [videoSessionError, setVideoSessionError] = useState<string | null>(null);
 
     // Download State
@@ -195,7 +198,7 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
 
     // Audio Context
     const audioContextRef = useRef<AudioContext | null>(null);
-    const sourceRef = useRef<AudioBufferSourceNode | null>(null);
+    const streamedAudioPlayerRef = useRef<StreamedAudioPlayer | null>(null);
     // TTS Streaming State
     // TTS Streaming State
     const sentenceBuffer = useRef<string>('');
@@ -207,9 +210,7 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
     const isSpeakingRef = useRef<boolean>(false);
 
     // Audio Scheduling & Auto-Listen Refs
-    const nextStartTimeRef = useRef<number>(0);
     const activeSourcesRef = useRef<number>(0);
-    const activeSourceNodesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
     const isPlayingRef = useRef<boolean>(false); // Sync with isPlaying for closures
     const isLLMGeneratingRef = useRef<boolean>(false);
     const isMountedRef = useRef<boolean>(true); // Track mount status
@@ -268,10 +269,12 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
     const FSMN_VAD_MIN_WAVEFORM_SAMPLES = 3200;
     const FSMN_VAD_MAX_WINDOW_SECONDS = 12;
 
-    const cleanupRemoteSession = React.useCallback(async () => {
+    const cleanupRemoteSession = React.useCallback(async (reason: string = 'unknown') => {
+        console.log('[Avatar Session] cleanup requested:', reason);
         const client = avatarSessionClientRef.current;
         avatarSessionClientRef.current = null;
         setRemoteRtcConnected(false);
+        setVideoSegments([]);
         setRemoteSession(null);
         if (client) {
             await client.stop().catch(() => undefined);
@@ -301,6 +304,10 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
     useEffect(() => {
         messagesRef.current = messages;
     }, [messages]);
+
+    useEffect(() => {
+        console.log('[Avatar Session] remoteSession state=', remoteSession?.sessionId ?? null);
+    }, [remoteSession]);
 
     // 1. Load Models (Manual Trigger now)
 
@@ -383,6 +390,31 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
 
         // Initialize Audio Context for TTS (Pocket TTS uses 24000Hz)
         audioContextRef.current = new AudioContext({ sampleRate: 24000 });
+        streamedAudioPlayerRef.current = new StreamedAudioPlayer(audioContextRef.current, {
+            sampleRate: 24000,
+            targetPeak: PLAYBACK_TARGET_PEAK,
+            maxGain: PLAYBACK_MAX_GAIN,
+            outputBoost: PLAYBACK_OUTPUT_BOOST,
+            firstChunkPrerollMs: TTS_FIRST_CHUNK_PREROLL_MS,
+            onActiveSourceCountChange: (count) => {
+                activeSourcesRef.current = count;
+            },
+            onIdle: () => {
+                const isActuallyDone =
+                    !isLLMGeneratingRef.current &&
+                    ttsQueue.current.length === 0 &&
+                    !isProcessingQueue.current;
+
+                if (isActuallyDone) {
+                    if (sessionActiveRef.current && !isRecordingRef.current) {
+                        console.log('[Auto-Listen] Finish detected. Restarting...');
+                        startRecordingSafe();
+                    }
+                    setIsPlaying(false);
+                    isPlayingRef.current = false;
+                }
+            },
+        });
         console.log('[Audio] Context initialized');
         isMountedRef.current = true;
 
@@ -390,7 +422,9 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
             console.log('[Audio] Cleanup...');
             isMountedRef.current = false;
             handleStop();
-            void cleanupRemoteSession();
+            void cleanupRemoteSession('audio effect unmount');
+            streamedAudioPlayerRef.current?.stopAll();
+            streamedAudioPlayerRef.current = null;
             audioContextRef.current?.close();
             audioContextRef.current = null;
         };
@@ -715,6 +749,17 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
                     if (!sessionActiveRef.current || !llmReadyRef.current || !ttsReadyRef.current) {
                         return;
                     }
+                    const shouldUseRemoteAvatar =
+                        isVideoExperience && Boolean(remoteSession || avatarSessionClientRef.current);
+                    if (shouldUseRemoteAvatar) {
+                        const remoteReady = await waitForAvatarSessionReady();
+                        if (!remoteReady) {
+                            const message = 'Timed out waiting for avatar worker before first greeting.';
+                            console.error('[Avatar Session] ' + message);
+                            setVideoSessionError(message);
+                            await cleanupRemoteSession('avatar wait before first greeting timed out');
+                        }
+                    }
 
                     activeSystemPromptRef.current = systemPrompt;
                     llm.configure({
@@ -787,17 +832,8 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
         } catch { }
         ttsQueue.current = []; // Clear queue
         sentenceBuffer.current = '';
-        if (tts.isGenerating || isPlaying) {
-            for (const src of activeSourceNodesRef.current) {
-                try {
-                    src.stop();
-                } catch { }
-            }
-            activeSourceNodesRef.current.clear();
-            sourceRef.current = null;
-        }
+        streamedAudioPlayerRef.current?.stopAll();
         activeSourcesRef.current = 0;
-        nextStartTimeRef.current = 0;
         setIsPlaying(false);
         isPlayingRef.current = false;
         setIsRecording(false);
@@ -818,7 +854,7 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
         silenceStartRef.current = null;
         isSpeakingRef.current = false;
         setVideoSessionError(null);
-        void cleanupRemoteSession();
+        void cleanupRemoteSession('handleStop');
 
         // Explicitly stop recorder cleanup (since we keep it running now)
         try {
@@ -843,15 +879,8 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
             } catch { }
             ttsQueue.current = [];
             sentenceBuffer.current = '';
-            for (const src of activeSourceNodesRef.current) {
-                try {
-                    src.stop();
-                } catch { }
-            }
-            activeSourceNodesRef.current.clear();
-            sourceRef.current = null;
+            streamedAudioPlayerRef.current?.stopAll();
             activeSourcesRef.current = 0;
-            nextStartTimeRef.current = 0;
             setIsPlaying(false);
             isPlayingRef.current = false;
             playbackSuppressUntilRef.current = Date.now() + BARGE_IN_COOLDOWN_MS;
@@ -865,6 +894,17 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
         while ((llm.isGenerating || isLLMGeneratingRef.current) && Date.now() - start < timeoutMs) {
             await new Promise(r => setTimeout(r, 25));
         }
+    };
+
+    const waitForAvatarSessionReady = async (timeoutMs: number = 15000) => {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            if (avatarSessionClientRef.current?.isReady()) {
+                return true;
+            }
+            await new Promise(r => setTimeout(r, 50));
+        }
+        return false;
     };
 
     const handleStartSession = async () => {
@@ -887,6 +927,8 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
 
         if (isVideoExperience && controlPlaneUrl) {
             setVideoSessionError(null);
+            setVideoSegments([]);
+            setRemoteRtcConnected(false);
             try {
                 console.log('[Avatar Session] controlPlaneUrl=', controlPlaneUrl);
                 console.log('[Avatar Session] creating control-plane session...');
@@ -904,6 +946,24 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
                     onStopped: () => {
                         setRemoteRtcConnected(false);
                     },
+                    onVideoSegment: (segment) => {
+                        console.log(
+                            `[Avatar Session] video segment ready index=${segment.segmentIndex} final=${String(segment.final)} url=${segment.url}`,
+                        );
+                        setRemoteRtcConnected(true);
+                        setVideoSegments((existing) => {
+                            if (
+                                existing.some(
+                                    (entry) =>
+                                        entry.sessionId === segment.sessionId &&
+                                        entry.segmentIndex === segment.segmentIndex,
+                                )
+                            ) {
+                                return existing;
+                            }
+                            return [...existing, segment].sort((left, right) => left.segmentIndex - right.segmentIndex);
+                        });
+                    },
                 });
                 console.log('[Avatar Session] connecting worker websocket...', created.workerWsUrl);
                 await client.connect();
@@ -912,11 +972,18 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
                 setRemoteSession(created);
                 console.log('[Avatar Session] remote session created', created);
             } catch (e) {
-                const message = e instanceof Error ? e.message : String(e);
-                console.error('[Avatar Session] Failed to start remote session:', e);
+                const message = getFriendlyVideoSessionError(e);
+                if (isNoCapacitySessionError(e)) {
+                    console.warn('[Avatar Session] Remote avatar unavailable, falling back to local audio.', e);
+                } else {
+                    console.error('[Avatar Session] Failed to start remote session:', e);
+                }
                 setVideoSessionError(message);
-                setLoadError(`Video session failed: ${message}`);
-                return;
+                if (!isNoCapacitySessionError(e)) {
+                    setLoadError(`Video session failed: ${message}`);
+                    return;
+                }
+                await cleanupRemoteSession('remote start no capacity');
             }
         } else if (isVideoExperience && !controlPlaneUrl) {
             console.warn('[Avatar Session] EXPO_PUBLIC_CONTROL_PLANE_URL is not set; video tab will stay local-only.');
@@ -928,7 +995,7 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
         } catch (e) {
             console.error('[TTS] Failed to prime selected voice:', e);
             setLoadError(`Voice priming failed: ${e instanceof Error ? e.message : String(e)}`);
-            void cleanupRemoteSession();
+            void cleanupRemoteSession('tts prime failure');
             return;
         }
 
@@ -1257,6 +1324,16 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
             console.log('[TTS] Skipping non-lexical chunk:', normalizedText);
             return;
         }
+        const shouldUseRemoteAvatar = isVideoExperience && Boolean(remoteSession || avatarSessionClientRef.current);
+        if (shouldUseRemoteAvatar) {
+            const remoteReady = await waitForAvatarSessionReady();
+            if (!remoteReady) {
+                const message = `Avatar worker was not ready to receive "${normalizedText.slice(0, 48)}".`;
+                console.error('[Avatar Session] ' + message);
+                setVideoSessionError(message);
+                await cleanupRemoteSession('avatar session not ready for tts');
+            }
+        }
         if (!ttsReadyRef.current || !isMountedRef.current) {
             console.warn('[TTS] Model not ready or unmounted. Skipping chunk:', normalizedText);
             return;
@@ -1267,7 +1344,10 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
         try {
             const audioContext = audioContextRef.current;
             if (!audioContext) return;
+            const streamedAudioPlayer = streamedAudioPlayerRef.current;
+            if (!streamedAudioPlayer) return;
             if (audioContext.state === 'suspended') await audioContext.resume();
+            streamedAudioPlayer.startUtterance();
 
             // Ensure any stale STT stream is closed before speaking.
             if (speechToText.isGenerating) {
@@ -1277,7 +1357,7 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
             }
 
             let ambientStarted = false;
-            let chunkCount = 0;
+            let receivedChunkCount = 0;
             const maybeStartAmbientListener = () => {
                 if (ambientStarted) return;
                 if (!sessionActiveRef.current) return;
@@ -1291,104 +1371,25 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
             const scheduleAudioVector = (audioVec: Float32Array) => {
                 if (playbackGeneration !== playbackGenerationRef.current || !sessionActiveRef.current) return;
                 if (!audioVec || audioVec.length === 0) return;
-
-                let peak = 0;
-                let sum = 0;
-                for (let i = 0; i < audioVec.length; i++) {
-                    const v = audioVec[i];
-                    const a = Math.abs(v);
-                    if (a > peak) peak = a;
-                    sum += v * v;
-                }
-                const rms = Math.sqrt(sum / audioVec.length);
-                let gain = 1;
-                if (peak > 0 && peak < PLAYBACK_TARGET_PEAK) {
-                    gain = Math.min(PLAYBACK_MAX_GAIN, PLAYBACK_TARGET_PEAK / peak);
-                }
-                const totalGain = gain * PLAYBACK_OUTPUT_BOOST;
-                const needsGain = Math.abs(totalGain - 1) > 0.05;
-                let playbackVec = audioVec;
-                if (needsGain) {
-                    playbackVec = new Float32Array(audioVec.length);
-                    for (let i = 0; i < audioVec.length; i++) {
-                        const s = audioVec[i] * totalGain;
-                        // Soft-limiter to keep output louder without harsh clipping.
-                        playbackVec[i] = Math.tanh(s);
-                    }
-                }
-
-                if (chunkCount === 1) {
-                    const prerollSamples = Math.max(1, Math.round((TTS_FIRST_CHUNK_PREROLL_MS / 1000) * 24000));
-                    const padded = new Float32Array(prerollSamples + playbackVec.length);
-                    padded.set(playbackVec, prerollSamples);
-                    playbackVec = padded;
-                }
-
-                if (chunkCount === 1) {
-                    console.log(
-                        `[TTS Playback] First chunk samples=${audioVec.length} peak=${peak.toFixed(4)} rms=${rms.toFixed(4)} gain=${gain.toFixed(2)} totalGain=${totalGain.toFixed(2)} ctx=${audioContext.state}`
-                    );
-                }
-
-                const audioBuffer = createAudioBufferFromVector(playbackVec, audioContext, 24000);
-                const source = audioContext.createBufferSource();
-                source.buffer = audioBuffer;
-                source.connect(audioContext.destination);
-
-                // Audio Scheduling
-                const currentTime = audioContext.currentTime;
-                if (nextStartTimeRef.current < currentTime) {
-                    nextStartTimeRef.current = currentTime;
-                }
-                const startTime = nextStartTimeRef.current;
-                source.start(startTime);
-                nextStartTimeRef.current += audioBuffer.duration;
-
-                // Track active sources
-                activeSourcesRef.current++;
-                sourceRef.current = source;
-                activeSourceNodesRef.current.add(source);
-
-                let ended = false;
-                const handleSourceEnded = () => {
-                    if (ended) return;
-                    ended = true;
-                    activeSourceNodesRef.current.delete(source);
-                    activeSourcesRef.current--;
-
-                    const isActuallyDone = activeSourcesRef.current === 0 &&
-                        !isLLMGeneratingRef.current &&
-                        ttsQueue.current.length === 0 &&
-                        !isProcessingQueue.current;
-
-                    if (isActuallyDone) {
-                        if (sessionActiveRef.current && !isRecordingRef.current) {
-                            console.log('[Auto-Listen] Finish detected. Restarting...');
-                            startRecordingSafe();
-                        }
-                        setIsPlaying(false);
-                        isPlayingRef.current = false;
-                    }
-                };
-
-                // Different runtimes expose either onEnded or onended.
-                (source as any).onEnded = handleSourceEnded;
-                (source as any).onended = handleSourceEnded;
+                streamedAudioPlayer.scheduleChunk(audioVec);
             };
 
             const onNext = async (audioVec: Float32Array) => {
-                chunkCount++;
+                receivedChunkCount++;
+                let playedRemotely = false;
                 if (isVideoExperience && avatarSessionClientRef.current?.isReady()) {
                     try {
                         await avatarSessionClientRef.current.appendFloat32Chunk(audioVec, 24000, 1);
+                        playedRemotely = true;
                     } catch (error) {
                         const message = error instanceof Error ? error.message : String(error);
                         console.error('[Avatar Session] Failed to forward TTS chunk:', error);
                         setVideoSessionError(message);
+                        await cleanupRemoteSession('tts forward failure');
                     }
                 }
 
-                if (!(isVideoExperience && remoteRtcConnected)) {
+                if (!playedRemotely) {
                     scheduleAudioVector(audioVec);
                 }
                 maybeStartAmbientListener();
@@ -1426,7 +1427,7 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
             }
 
             // Some runs can finish without yielding any stream chunks. Fallback to one-shot synthesis.
-            if (!streamError && chunkCount === 0) {
+            if (!streamError && receivedChunkCount === 0) {
                 console.warn('[TTS] Stream produced no chunks. Falling back to forward().');
                 let fallbackAudio: Float32Array | null = null;
                 for (let fallbackAttempt = 0; fallbackAttempt < 2; fallbackAttempt++) {
@@ -1440,7 +1441,21 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
                     }
                 }
                 if (fallbackAudio && fallbackAudio.length > 0) {
-                    scheduleAudioVector(fallbackAudio);
+                    let playedRemotely = false;
+                    if (isVideoExperience && avatarSessionClientRef.current?.isReady()) {
+                        try {
+                            await avatarSessionClientRef.current.appendFloat32Chunk(fallbackAudio, 24000, 1);
+                            playedRemotely = true;
+                        } catch (error) {
+                            const message = error instanceof Error ? error.message : String(error);
+                            console.error('[Avatar Session] Failed to forward fallback TTS chunk:', error);
+                            setVideoSessionError(message);
+                            await cleanupRemoteSession('fallback tts forward failure');
+                        }
+                    }
+                    if (!playedRemotely) {
+                        scheduleAudioVector(fallbackAudio);
+                    }
                     maybeStartAmbientListener();
                 } else {
                     // Treat as a soft drop instead of hard TTS failure to keep the session flowing.
@@ -1452,15 +1467,15 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
                 throw streamError;
             }
 
-            if (isVideoExperience) {
+            if (isVideoExperience && avatarSessionClientRef.current?.isReady()) {
                 avatarSessionClientRef.current?.signalAudioEnd();
             }
         } catch (error) {
             console.error('TTS Error:', error);
+            streamedAudioPlayerRef.current?.stopAll();
             setIsPlaying(false);
             isPlayingRef.current = false;
             activeSourcesRef.current = 0;
-            nextStartTimeRef.current = 0;
         }
     };
 
@@ -1587,8 +1602,9 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
                                 </View>
 
                                 <View style={styles.videoStageCanvas}>
-                                    <CloudflareSubscriberMeeting
-                                        credentials={remoteSession?.rtcCredentials ?? null}
+                                    <SoulxSegmentPlayer
+                                        sessionId={remoteSession?.sessionId ?? null}
+                                        segments={videoSegments}
                                         onConnectedChange={handleRemoteRtcConnected}
                                         onError={handleRemoteRtcError}
                                     />
@@ -1600,8 +1616,8 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
                                         <Text style={styles.videoStageOverlaySubLabel}>
                                             {remoteSession
                                                 ? (remoteRtcConnected
-                                                    ? 'Subscriber joined. Avatar audio/video will return from Cloudflare only.'
-                                                    : 'Connecting subscriber session and worker bridge...')
+                                                    ? 'SoulX segment stream attached. Avatar audio/video is coming from worker-rendered MP4 chunks.'
+                                                    : 'Worker session is live. Waiting for the first SoulX video segment...')
                                                 : 'Voice agent loop active, video stream will attach when the backend session starts.'}
                                         </Text>
                                     </View>

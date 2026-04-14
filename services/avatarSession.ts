@@ -18,9 +18,18 @@ export interface AvatarSessionResponse {
     status: 'assigned';
 }
 
+export interface AvatarVideoSegment {
+    sessionId: string;
+    segmentIndex: number;
+    url: string;
+    final: boolean;
+    durationSeconds?: number;
+}
+
 type AvatarClientEvent =
     | { type: 'session.ready'; sessionId: string; provider: string }
     | { type: 'audio.ack'; sessionId: string; sequence: number; totalAudioBytes: number; estimatedFrames: number }
+    | { type: 'video.segment'; sessionId: string; segmentIndex: number; url: string; final: boolean; durationSeconds?: number }
     | { type: 'heartbeat.ack'; sessionId: string; active: boolean }
     | { type: 'session.stopped'; sessionId: string }
     | { type: 'session.error'; sessionId: string; code: string; message: string; recoverable: boolean }
@@ -31,6 +40,26 @@ export interface AvatarSessionClientCallbacks {
     onStopped?: () => void;
     onError?: (message: string) => void;
     onAck?: (event: Extract<AvatarClientEvent, { type: 'audio.ack' }>) => void;
+    onVideoSegment?: (segment: AvatarVideoSegment) => void;
+}
+
+interface AvatarSessionErrorPayload {
+    error?: string;
+    message?: string;
+    details?: Record<string, unknown> | null;
+}
+
+export class AvatarSessionError extends Error {
+    readonly status: number;
+    readonly code: string;
+    readonly details?: Record<string, unknown> | null;
+
+    constructor(message: string, status: number, code: string, details?: Record<string, unknown> | null) {
+        super(message);
+        this.status = status;
+        this.code = code;
+        this.details = details;
+    }
 }
 
 function timeoutAfter<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
@@ -99,7 +128,16 @@ export async function createAvatarSession(
 
     if (!response.ok) {
         const body = await response.text();
-        throw new Error(`Session creation failed with HTTP ${response.status}: ${body}`);
+        let parsed: AvatarSessionErrorPayload | null = null;
+        try {
+            parsed = JSON.parse(body) as AvatarSessionErrorPayload;
+        } catch {
+            parsed = null;
+        }
+
+        const message = parsed?.message?.trim() || `Session creation failed with HTTP ${response.status}.`;
+        const code = parsed?.error?.trim() || 'session_creation_failed';
+        throw new AvatarSessionError(message, response.status, code, parsed?.details ?? null);
     }
 
     return (await response.json()) as AvatarSessionResponse;
@@ -173,6 +211,17 @@ export class AvatarSessionClient {
 
                 if (payload.type === 'audio.ack') {
                     this.callbacks.onAck?.(payload);
+                    return;
+                }
+
+                if (payload.type === 'video.segment') {
+                    this.callbacks.onVideoSegment?.({
+                        sessionId: payload.sessionId,
+                        segmentIndex: payload.segmentIndex,
+                        url: payload.url,
+                        final: payload.final,
+                        durationSeconds: payload.durationSeconds,
+                    });
                     return;
                 }
 

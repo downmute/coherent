@@ -137,6 +137,16 @@ const config: ControlPlaneConfig = {
   SIMPLEPOD_GPU_MODEL: 'RTX4090',
   SIMPLEPOD_REGION: '',
   SIMPLEPOD_PROVISION_PATH: '/instances',
+  SIMPLEPOD_ALLOWED_CUDA_VERSIONS: '',
+  RUNPOD_API_BASE_URL: 'https://rest.runpod.io/v1',
+  RUNPOD_API_KEY: '',
+  RUNPOD_TEMPLATE_ID: '',
+  RUNPOD_GPU_TYPE_IDS: 'NVIDIA GeForce RTX 4090',
+  RUNPOD_CLOUD_TYPE: 'SECURE',
+  RUNPOD_ALLOWED_CUDA_VERSIONS: '',
+  RUNPOD_DATA_CENTER_IDS: '',
+  RUNPOD_COUNTRY_CODES: '',
+  RUNPOD_NAME_PREFIX: 'coherent-worker',
 };
 
 describe('SchedulerService', () => {

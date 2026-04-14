@@ -14,6 +14,31 @@ type RealtimeUiModule = {
     PeerView?: React.ComponentType<Record<string, unknown>>;
 };
 
+function shouldSuppressDyteLog(args: unknown[]): boolean {
+    const message = args
+        .map((value) => {
+            if (typeof value === 'string') {
+                return value;
+            }
+
+            try {
+                return JSON.stringify(value);
+            } catch {
+                return String(value);
+            }
+        })
+        .join(' ');
+
+    return message.includes('DyteInternalLogs::');
+}
+
+function isManualSubscriptionModeWarning(message: string): boolean {
+    return (
+        message.includes('Manual Subscription Mode was not ACTIVATED') ||
+        message.includes('MANUAL subscription mode was not activated')
+    );
+}
+
 function getRealtimeCore(): RealtimeCoreModule | null {
     try {
         // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -26,7 +51,23 @@ function getRealtimeCore(): RealtimeCoreModule | null {
 function getRealtimeUi(): RealtimeUiModule | null {
     try {
         // eslint-disable-next-line @typescript-eslint/no-require-imports
-        return require('@cloudflare/realtimekit-react-native-ui') as RealtimeUiModule;
+        const rootModule = require('@cloudflare/realtimekit-react-native-ui') as RealtimeUiModule;
+        if (rootModule.PeerView) {
+            return rootModule;
+        }
+
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-require-imports
+            const peerViewModule = require('@cloudflare/realtimekit-react-native-ui/lib/module/PeerView') as {
+                default?: React.ComponentType<Record<string, unknown>>;
+            };
+            return {
+                ...rootModule,
+                PeerView: peerViewModule.default,
+            };
+        } catch {
+            return rootModule;
+        }
     } catch {
         return null;
     }
@@ -48,6 +89,41 @@ function SubscriberMeetingInner({
     const [meeting, initMeeting] = core.useRealtimeKitClient();
     const connectedChangeRef = React.useRef(onConnectedChange);
     const errorRef = React.useRef(onError);
+    const initMeetingRef = React.useRef(initMeeting);
+    const initializedAuthTokenRef = React.useRef<string | null>(null);
+    const joinedMeetingRef = React.useRef<any>(null);
+    const activeMeetingRef = React.useRef<any>(null);
+
+    React.useEffect(() => {
+        const originalDebug = console.debug;
+        const originalInfo = console.info;
+        const originalLog = console.log;
+
+        console.debug = (...args: unknown[]) => {
+            if (shouldSuppressDyteLog(args)) {
+                return;
+            }
+            originalDebug(...args);
+        };
+        console.info = (...args: unknown[]) => {
+            if (shouldSuppressDyteLog(args)) {
+                return;
+            }
+            originalInfo(...args);
+        };
+        console.log = (...args: unknown[]) => {
+            if (shouldSuppressDyteLog(args)) {
+                return;
+            }
+            originalLog(...args);
+        };
+
+        return () => {
+            console.debug = originalDebug;
+            console.info = originalInfo;
+            console.log = originalLog;
+        };
+    }, []);
 
     React.useEffect(() => {
         connectedChangeRef.current = onConnectedChange;
@@ -58,11 +134,23 @@ function SubscriberMeetingInner({
     }, [onError]);
 
     React.useEffect(() => {
+        initMeetingRef.current = initMeeting;
+    }, [initMeeting]);
+
+    React.useEffect(() => {
         let cancelled = false;
+
+        if (initializedAuthTokenRef.current === authToken) {
+            return () => {
+                cancelled = true;
+            };
+        }
+        initializedAuthTokenRef.current = authToken;
 
         const init = async () => {
             try {
-                await initMeeting({
+                console.log('[rtc-subscriber] initializing RealtimeKit client');
+                await initMeetingRef.current({
                     authToken,
                     defaults: {
                         audio: false,
@@ -70,14 +158,20 @@ function SubscriberMeetingInner({
                     },
                     modules: {
                         devTools: {
-                            logs: true,
+                            logs: false,
                         },
                     },
                     onError: (error: unknown) => {
                         const message = error instanceof Error ? error.message : String(error);
+                        if (isManualSubscriptionModeWarning(message)) {
+                            console.log('[rtc-subscriber] auto-subscription mode active');
+                            return;
+                        }
+                        console.error('[rtc-subscriber] sdk error:', message);
                         errorRef.current?.(message);
                     },
                 });
+                console.log('[rtc-subscriber] RealtimeKit client initialized');
             } catch (error) {
                 if (!cancelled) {
                     errorRef.current?.(error instanceof Error ? error.message : String(error));
@@ -89,7 +183,7 @@ function SubscriberMeetingInner({
         return () => {
             cancelled = true;
         };
-    }, [authToken, initMeeting]);
+    }, [authToken]);
 
     React.useEffect(() => {
         let cancelled = false;
@@ -98,13 +192,20 @@ function SubscriberMeetingInner({
             if (!meeting) {
                 return;
             }
+            if (joinedMeetingRef.current === meeting) {
+                return;
+            }
+            joinedMeetingRef.current = meeting;
+            activeMeetingRef.current = meeting;
 
             try {
+                console.log('[rtc-subscriber] joining room');
                 if (typeof meeting.joinRoom === 'function') {
                     await meeting.joinRoom();
                 } else if (typeof meeting.join === 'function') {
                     await meeting.join();
                 }
+                console.log('[rtc-subscriber] room join completed');
 
                 if (typeof meeting?.self?.disableAudio === 'function') {
                     await meeting.self.disableAudio();
@@ -112,6 +213,7 @@ function SubscriberMeetingInner({
                 if (typeof meeting?.self?.disableVideo === 'function') {
                     await meeting.self.disableVideo();
                 }
+                console.log('[rtc-subscriber] local audio/video disabled for subscriber mode');
             } catch (error) {
                 if (!cancelled) {
                     connectedChangeRef.current?.(false);
@@ -125,11 +227,22 @@ function SubscriberMeetingInner({
         return () => {
             cancelled = true;
             connectedChangeRef.current?.(false);
-            if (meeting && typeof meeting.leave === 'function') {
-                void meeting.leave().catch(() => undefined);
-            }
         };
     }, [meeting]);
+
+    React.useEffect(() => {
+        return () => {
+            connectedChangeRef.current?.(false);
+            const activeMeeting = activeMeetingRef.current;
+            activeMeetingRef.current = null;
+            joinedMeetingRef.current = null;
+            initializedAuthTokenRef.current = null;
+            if (activeMeeting && typeof activeMeeting.leave === 'function') {
+                console.log('[rtc-subscriber] leaving room');
+                void activeMeeting.leave().catch(() => undefined);
+            }
+        };
+    }, [authToken]);
 
     if (!meeting) {
         return (
@@ -227,23 +340,30 @@ function SubscriberMedia({
     ]);
 
     React.useEffect(() => {
-        if (!state.roomJoined || state.remoteJoined.length === 0) {
+        if (state.remoteJoined.length === 0) {
             return;
         }
 
-        const participantIds = state.remoteJoined.map((participant: any) => String(participant.id));
-        void meeting.participants
-            .subscribe(participantIds, ['audio', 'video'])
-            .catch((error: unknown) => {
-                const message = error instanceof Error ? error.message : String(error);
-                console.error('[rtc-subscriber] subscribe failed:', error);
-                onError?.(message);
-            });
-    }, [meeting, onError, remotePeerIdsKey, state.remoteJoined, state.roomJoined]);
+        const details = state.remoteJoined.map((participant: any) => ({
+            id: String(participant.id),
+            name: String(participant.name ?? ''),
+            videoEnabled: Boolean(participant.videoEnabled),
+            audioEnabled: Boolean(participant.audioEnabled),
+            screenShareEnabled: Boolean(participant.screenShareEnabled),
+            presetName: String(participant.presetName ?? ''),
+        }));
+        console.log('[rtc-subscriber] remote participant details', details);
+    }, [remotePeerIdsKey, state.remoteJoined]);
 
     const PeerView = ui?.PeerView;
     const primaryParticipant = state.videoSubscribed[0] ?? state.remoteJoined[0] ?? null;
     const participantWidth = Math.max(280, width - 48);
+
+    React.useEffect(() => {
+        console.log(
+            `[rtc-subscriber] renderer PeerView=${Boolean(PeerView)} primaryParticipant=${primaryParticipant ? String(primaryParticipant.id) : 'none'}`,
+        );
+    }, [PeerView, primaryParticipant]);
 
     if (PeerView && primaryParticipant) {
         return (

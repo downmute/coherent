@@ -19,8 +19,36 @@ interface Env {
   SIMPLEPOD_GPU_MODEL?: string;
   SIMPLEPOD_REGION?: string;
   SIMPLEPOD_PROVISION_PATH?: string;
+  SIMPLEPOD_ALLOWED_CUDA_VERSIONS?: string;
+  RUNPOD_API_BASE_URL?: string;
+  RUNPOD_API_KEY?: string;
+  RUNPOD_TEMPLATE_ID?: string;
+  RUNPOD_GPU_TYPE_IDS?: string;
+  RUNPOD_CLOUD_TYPE?: 'SECURE' | 'COMMUNITY';
+  RUNPOD_ALLOWED_CUDA_VERSIONS?: string;
+  RUNPOD_DATA_CENTER_IDS?: string;
+  RUNPOD_COUNTRY_CODES?: string;
+  RUNPOD_NAME_PREFIX?: string;
   SESSION_PROVISION_TIMEOUT_MS?: string;
   SESSION_PROVISION_POLL_MS?: string;
+}
+
+class HttpError extends Error {
+  readonly status: number;
+  readonly code: string;
+  readonly details?: Record<string, unknown>;
+
+  constructor(
+    message: string,
+    status = 500,
+    code = 'internal_error',
+    details?: Record<string, unknown>,
+  ) {
+    super(message);
+    this.status = status;
+    this.code = code;
+    this.details = details;
+  }
 }
 
 interface SessionCreateRequest {
@@ -351,6 +379,11 @@ async function requestSimplePodProvision(env: Env, metadata: Record<string, unkn
     return null;
   }
 
+  const allowedCudaVersions = (env.SIMPLEPOD_ALLOWED_CUDA_VERSIONS || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+
   const response = await fetch(
     `${env.SIMPLEPOD_API_BASE_URL.replace(/\/$/, '')}${env.SIMPLEPOD_PROVISION_PATH || '/instances'}`,
     {
@@ -363,30 +396,76 @@ async function requestSimplePodProvision(env: Env, metadata: Record<string, unkn
         templateId: env.SIMPLEPOD_TEMPLATE_ID,
         gpuModel: env.SIMPLEPOD_GPU_MODEL || 'RTX4090',
         region: env.SIMPLEPOD_REGION || undefined,
+        allowedCudaVersions: allowedCudaVersions.length > 0 ? allowedCudaVersions : undefined,
         metadata,
       }),
     },
   );
 
   if (!response.ok) {
-    throw new Error(`SimplePod provisioning failed with HTTP ${response.status}.`);
+    throw new Error(`Worker provisioning failed with HTTP ${response.status}.`);
   }
 
   const json = (await response.json()) as { instanceId?: string; id?: string };
   return json.instanceId || json.id || null;
 }
 
+async function requestRunpodProvision(env: Env, metadata: Record<string, unknown>): Promise<string | null> {
+  if (!env.RUNPOD_API_KEY || !env.RUNPOD_TEMPLATE_ID || !env.RUNPOD_GPU_TYPE_IDS) {
+    return null;
+  }
+
+  const parseCsv = (value: string | undefined): string[] =>
+    (value || '')
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+
+  const response = await fetch(`${(env.RUNPOD_API_BASE_URL || 'https://rest.runpod.io/v1').replace(/\/$/, '')}/pods`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${env.RUNPOD_API_KEY}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      name: `${env.RUNPOD_NAME_PREFIX || 'coherent-worker'}-${randomId().slice(0, 8)}`,
+      templateId: env.RUNPOD_TEMPLATE_ID,
+      cloudType: env.RUNPOD_CLOUD_TYPE || 'SECURE',
+      computeType: 'GPU',
+      gpuCount: 1,
+      gpuTypeIds: parseCsv(env.RUNPOD_GPU_TYPE_IDS),
+      allowedCudaVersions: parseCsv(env.RUNPOD_ALLOWED_CUDA_VERSIONS),
+      dataCenterIds: parseCsv(env.RUNPOD_DATA_CENTER_IDS),
+      countryCodes: parseCsv(env.RUNPOD_COUNTRY_CODES),
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Runpod provisioning failed with HTTP ${response.status}.`);
+  }
+
+  const json = (await response.json()) as { id?: string; podId?: string; instanceId?: string };
+  return json.id || json.podId || json.instanceId || null;
+}
+
 async function createSession(env: Env, request: SessionCreateRequest): Promise<CreateSessionResponse> {
   let allocation = await reserveWarmWorker(env, request);
 
   if (!allocation) {
-    const providerInstanceId = await requestSimplePodProvision(env, {
+    const provisionMetadata = {
       requestedAt: new Date().toISOString(),
       avatarConfig: request.avatarConfig ?? {},
-    });
+    };
+    const providerInstanceId =
+      (await requestRunpodProvision(env, provisionMetadata)) ||
+      (await requestSimplePodProvision(env, provisionMetadata));
 
     if (!providerInstanceId) {
-      throw new Error('No warm worker is available and SimplePod provisioning is not configured.');
+      throw new HttpError(
+        'No warm worker is available and on-demand worker provisioning is not configured.',
+        503,
+        'no_capacity',
+      );
     }
 
     const timeoutMs = Number(env.SESSION_PROVISION_TIMEOUT_MS || '30000');
@@ -399,7 +478,11 @@ async function createSession(env: Env, request: SessionCreateRequest): Promise<C
     }
 
     if (!allocation) {
-      throw new Error('Provisioning started but no warm worker became ready in time.');
+      throw new HttpError(
+        'Provisioning started but no warm worker became ready in time.',
+        503,
+        'provisioning_timeout',
+      );
     }
   }
 
@@ -495,7 +578,7 @@ async function registerWorker(env: Env, request: RegisterWorkerRequest): Promise
 
   const row = await env.DB.prepare(`SELECT * FROM gpu_workers WHERE worker_key = ?`).bind(request.workerKey).first<Record<string, unknown>>();
   if (!row) {
-    throw new Error('Failed to register worker.');
+    throw new HttpError('Failed to register worker.');
   }
   return mapWorker(row);
 }
@@ -610,6 +693,17 @@ export default {
 
       return json({ error: 'not_found', message: 'Route not found.' }, { status: 404 });
     } catch (error) {
+      if (error instanceof HttpError) {
+        return json(
+          {
+            error: error.code,
+            message: error.message,
+            details: error.details ?? null,
+          } as unknown as JsonValue,
+          { status: error.status },
+        );
+      }
+
       return json(
         {
           error: 'internal_error',

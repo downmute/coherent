@@ -1,5 +1,6 @@
 import Fastify from 'fastify';
 import websocket from '@fastify/websocket';
+import fs from 'node:fs';
 import { z } from 'zod';
 import { getWorkerConfig } from '../shared/config.js';
 import { verifyToken } from '../shared/token.js';
@@ -9,6 +10,7 @@ import type {
   WorkerTokenPayload,
 } from '../shared/types.js';
 import { ControlPlaneClient } from './control-plane-client.js';
+import { resolveWorkerIdentity, resolveWorkerPublicWsUrl } from './public-url.js';
 import { SoulxRuntime } from './soulx-runtime.js';
 
 const messageSchema = z.discriminatedUnion('type', [
@@ -40,12 +42,39 @@ function send(socket: { send: (payload: string) => void }, message: WorkerToClie
   socket.send(JSON.stringify(message));
 }
 
+function getPublicHttpBaseUrl(wsUrl: string): string {
+  const url = new URL(wsUrl);
+  url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
+  url.pathname = '';
+  url.search = '';
+  url.hash = '';
+  return url.toString().replace(/\/$/, '');
+}
+
 export async function buildWorkerServer() {
-  const config = getWorkerConfig();
+  const rawConfig = getWorkerConfig();
+  const workerIdentity = resolveWorkerIdentity(rawConfig);
+  const config = {
+    ...rawConfig,
+    WORKER_KEY: workerIdentity.workerKey,
+    WORKER_PROVIDER_INSTANCE_ID: workerIdentity.providerInstanceId,
+  };
   const controlPlaneClient = new ControlPlaneClient(config);
   const runtime = new SoulxRuntime(config);
   const app = Fastify({ logger: true });
   await app.register(websocket);
+  const publicWs = resolveWorkerPublicWsUrl(config);
+  app.log.info(
+    {
+      source: publicWs.source,
+      workerKeySource: workerIdentity.workerKeySource,
+      providerInstanceIdSource: workerIdentity.providerInstanceIdSource,
+      workerKey: config.WORKER_KEY,
+      providerInstanceId: config.WORKER_PROVIDER_INSTANCE_ID || null,
+      publicWsUrl: publicWs.url,
+    },
+    'Resolved worker public websocket URL.',
+  );
 
   const registerPayload = {
     workerKey: config.WORKER_KEY,
@@ -54,7 +83,7 @@ export async function buildWorkerServer() {
     region: config.WORKER_REGION,
     gpuModel: config.WORKER_GPU_MODEL,
     maxSessions: config.WORKER_MAX_SESSIONS,
-    publicWsUrl: config.WORKER_PUBLIC_WS_URL,
+    publicWsUrl: publicWs.url,
     status: 'warm' as const,
     metadata: {},
   };
@@ -65,6 +94,23 @@ export async function buildWorkerServer() {
     workerKey: config.WORKER_KEY,
     activeSessions: runtime.getActiveSessionCount(),
   }));
+
+  app.get('/media/:sessionId/:fileName', async (request, reply) => {
+    const params = z
+      .object({
+        sessionId: z.string().uuid(),
+        fileName: z.string().min(1),
+      })
+      .parse(request.params);
+
+    const filePath = runtime.getMediaFilePath(params.sessionId, params.fileName);
+    if (!filePath) {
+      return reply.code(404).send({ error: 'media_not_found' });
+    }
+
+    reply.type('video/mp4');
+    return reply.send(fs.createReadStream(filePath));
+  });
 
   app.get('/ws', { websocket: true }, (socket, request) => {
     const query = z
@@ -87,6 +133,23 @@ export async function buildWorkerServer() {
         return;
       }
     }
+
+    const handleSegment = (event: import('./soulx-runtime.js').SegmentReadyEvent) => {
+      if (!sessionPayload || event.sessionId !== sessionPayload.sessionId) {
+        return;
+      }
+
+      send(socket, {
+        type: 'video.segment',
+        sessionId: event.sessionId,
+        segmentIndex: event.segmentIndex,
+        url: `${getPublicHttpBaseUrl(publicWs.url)}/media/${event.sessionId}/${encodeURIComponent(event.fileName)}`,
+        final: event.final,
+        durationSeconds: event.durationSeconds,
+      });
+    };
+
+    runtime.on('segment', handleSegment);
 
     socket.on('message', async (raw: Buffer) => {
       try {
@@ -121,7 +184,8 @@ export async function buildWorkerServer() {
             avatarConfig: payload.avatarConfig,
             publisherRtc: payload.publisherRtc,
             publisherOptions: {
-              mode: config.WORKER_RTC_PUBLISHER,
+              mode:
+                config.SOULX_DELIVERY_MODE === 'segment_mp4' ? 'mock' : config.WORKER_RTC_PUBLISHER,
               browserExecutablePath: config.WORKER_BROWSER_EXECUTABLE_PATH,
               headless: config.WORKER_RTC_HEADLESS,
               width: config.WORKER_RTC_VIEWPORT_WIDTH,
@@ -215,6 +279,7 @@ export async function buildWorkerServer() {
     });
 
     socket.on('close', () => {
+      runtime.off('segment', handleSegment);
       if (!sessionPayload) {
         return;
       }
@@ -228,20 +293,56 @@ export async function buildWorkerServer() {
     });
   });
 
+  let heartbeatTimer: NodeJS.Timeout | null = null;
+  let registerRetryTimer: NodeJS.Timeout | null = null;
+  let registeredWithControlPlane = false;
+
   app.addHook('onReady', async () => {
-    await controlPlaneClient.registerWorker(registerPayload);
+    await runtime.prewarmCommonBridges();
   });
 
-  let heartbeatTimer: NodeJS.Timeout | null = null;
   app.addHook('onListen', async () => {
+    const registerWorker = async () => {
+      try {
+        await controlPlaneClient.registerWorker(registerPayload);
+        registeredWithControlPlane = true;
+        app.log.info(
+          {
+            workerKey: config.WORKER_KEY,
+            providerInstanceId: config.WORKER_PROVIDER_INSTANCE_ID || null,
+          },
+          'Worker registered with control plane.',
+        );
+      } catch (error) {
+        registeredWithControlPlane = false;
+        app.log.warn(error, 'Worker registration failed; retrying.');
+        registerRetryTimer = setTimeout(() => {
+          void registerWorker();
+        }, Math.max(5000, config.WORKER_HEARTBEAT_MS));
+      }
+    };
+
+    await registerWorker();
+
     heartbeatTimer = setInterval(() => {
+      if (!registeredWithControlPlane) {
+        return;
+      }
+
       void controlPlaneClient
         .heartbeat({
           status: runtime.getActiveSessionCount() >= config.WORKER_MAX_SESSIONS ? 'busy' : 'warm',
           activeSessions: runtime.getActiveSessionCount(),
         })
         .catch((error) => {
-          app.log.warn(error, 'Worker heartbeat failed.');
+          registeredWithControlPlane = false;
+          app.log.warn(error, 'Worker heartbeat failed; re-registering.');
+          if (!registerRetryTimer) {
+            registerRetryTimer = setTimeout(() => {
+              registerRetryTimer = null;
+              void registerWorker();
+            }, Math.max(5000, config.WORKER_HEARTBEAT_MS));
+          }
         });
     }, config.WORKER_HEARTBEAT_MS);
   });
@@ -249,6 +350,9 @@ export async function buildWorkerServer() {
   app.addHook('onClose', async () => {
     if (heartbeatTimer) {
       clearInterval(heartbeatTimer);
+    }
+    if (registerRetryTimer) {
+      clearTimeout(registerRetryTimer);
     }
   });
 

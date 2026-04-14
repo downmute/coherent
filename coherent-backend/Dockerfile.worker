@@ -50,6 +50,8 @@ RUN npm install
 
 COPY . .
 
+RUN npm run build
+
 RUN chmod +x scripts/bootstrap_soulx_worker.sh
 
 ENTRYPOINT ["bash", "scripts/bootstrap_soulx_worker.sh"]

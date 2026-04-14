@@ -6,7 +6,23 @@ import { ServiceError } from '../shared/errors.js';
 import { PostgresStore } from './db/postgres-store.js';
 import { SchedulerService } from './services/scheduler-service.js';
 import { SimplePodAdapter } from './adapters/simplepod.js';
+import { RunpodAdapter } from './adapters/runpod.js';
+import type { WorkerProvisioner } from './adapters/provider.js';
 import { RtcCredentialService } from './adapters/rtc.js';
+
+function parseAllowedCudaVersions(raw: string): string[] {
+  return raw
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function parseCsv(raw: string): string[] {
+  return raw
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
 
 const sessionCreateSchema = z.object({
   userId: z.string().optional(),
@@ -46,14 +62,29 @@ export async function buildControlPlaneServer() {
     await store.initializeSchema();
   }
 
-  const provider = new SimplePodAdapter({
+  const runpodProvider = new RunpodAdapter({
+    baseUrl: config.RUNPOD_API_BASE_URL,
+    apiKey: config.RUNPOD_API_KEY,
+    templateId: config.RUNPOD_TEMPLATE_ID,
+    gpuTypeIds: parseCsv(config.RUNPOD_GPU_TYPE_IDS),
+    cloudType: config.RUNPOD_CLOUD_TYPE,
+    allowedCudaVersions: parseCsv(config.RUNPOD_ALLOWED_CUDA_VERSIONS),
+    dataCenterIds: parseCsv(config.RUNPOD_DATA_CENTER_IDS),
+    countryCodes: parseCsv(config.RUNPOD_COUNTRY_CODES),
+    namePrefix: config.RUNPOD_NAME_PREFIX,
+  });
+  const simplepodProvider = new SimplePodAdapter({
     baseUrl: config.SIMPLEPOD_API_BASE_URL,
     apiKey: config.SIMPLEPOD_API_KEY,
     templateId: config.SIMPLEPOD_TEMPLATE_ID,
     gpuModel: config.SIMPLEPOD_GPU_MODEL,
     region: config.SIMPLEPOD_REGION,
     provisionPath: config.SIMPLEPOD_PROVISION_PATH,
+    allowedCudaVersions: parseAllowedCudaVersions(config.SIMPLEPOD_ALLOWED_CUDA_VERSIONS),
   });
+  const provider: WorkerProvisioner = runpodProvider.isConfigured()
+    ? runpodProvider
+    : simplepodProvider;
   const rtc = new RtcCredentialService({
     provider: config.RTC_PROVIDER,
     endpoint: config.RTC_ENDPOINT,

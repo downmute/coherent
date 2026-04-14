@@ -10,10 +10,14 @@ Pod::Spec.new do |s|
   s.source       = { :path => '.' }
   s.prepare_command = 'bash scripts/build_libdf_ios.sh'
 
-  s.source_files = 'ios/LibDFBridge.{h,m}'
-  s.public_header_files = 'ios/LibDFBridge.h'
+  s.source_files = ['ios/LibDFBridge.{h,m}', 'ios/include/**/*.h']
+  s.public_header_files = ['ios/LibDFBridge.h', 'ios/include/**/*.h']
+  s.header_mappings_dir = 'ios/include'
   s.preserve_paths = ['ios/LibDF.xcframework', 'ios/include/deep_filter.h', 'scripts/build_libdf_ios.sh']
   s.vendored_frameworks = 'ios/LibDF.xcframework'
+  s.pod_target_xcconfig = {
+    'HEADER_SEARCH_PATHS' => '"${PODS_TARGET_SRCROOT}/ios/include"'
+  }
 
   s.dependency 'React-Core'
 end

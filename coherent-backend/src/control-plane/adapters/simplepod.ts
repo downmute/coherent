@@ -1,10 +1,5 @@
 import { randomUUID } from 'node:crypto';
-
-export interface SimplePodProvisionResult {
-  requested: boolean;
-  providerInstanceId: string;
-  raw?: unknown;
-}
+import type { WorkerProvisionResult, WorkerProvisioner } from './provider.js';
 
 interface SimplePodAdapterConfig {
   baseUrl: string;
@@ -13,9 +8,10 @@ interface SimplePodAdapterConfig {
   gpuModel: string;
   region: string;
   provisionPath: string;
+  allowedCudaVersions?: string[];
 }
 
-export class SimplePodAdapter {
+export class SimplePodAdapter implements WorkerProvisioner {
   constructor(private readonly config: SimplePodAdapterConfig) {}
 
   isConfigured(): boolean {
@@ -27,7 +23,7 @@ export class SimplePodAdapter {
     );
   }
 
-  async requestProvision(metadata: Record<string, unknown>): Promise<SimplePodProvisionResult | null> {
+  async requestProvision(metadata: Record<string, unknown>): Promise<WorkerProvisionResult | null> {
     if (!this.isConfigured()) {
       return null;
     }
@@ -44,6 +40,10 @@ export class SimplePodAdapter {
           templateId: this.config.templateId,
           gpuModel: this.config.gpuModel,
           region: this.config.region || undefined,
+          allowedCudaVersions:
+            this.config.allowedCudaVersions && this.config.allowedCudaVersions.length > 0
+              ? this.config.allowedCudaVersions
+              : undefined,
           metadata,
         }),
       },

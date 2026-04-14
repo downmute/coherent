@@ -1,25 +1,50 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
+import os from 'node:os';
 import type { AvatarConfig, RtcCredentials } from '../shared/types.js';
 import { createRtcPublisher, type RtcPublisher } from './rtc-publisher.js';
 import type { WorkerConfig } from '../shared/config.js';
+
+export interface SegmentReadyEvent {
+  sessionId: string;
+  segmentIndex: number;
+  fileName: string;
+  absolutePath: string;
+  final: boolean;
+  durationSeconds?: number;
+}
+
+interface BridgeHandle {
+  id: string;
+  conditionImage: string;
+  mediaDir: string;
+  process: ChildProcessWithoutNullStreams;
+  ready: Promise<void>;
+  readyResolve?: () => void;
+  readyReject?: (error: Error) => void;
+  resetPromise: Promise<void> | null;
+  resetResolve?: () => void;
+  resetReject?: (error: Error) => void;
+  audioEndPromise: Promise<void> | null;
+  audioEndResolve?: () => void;
+  audioEndReject?: (error: Error) => void;
+  alive: boolean;
+  failure: string | null;
+  currentSessionId: string | null;
+}
 
 interface RuntimeSession {
   sessionId: string;
   avatarConfig: AvatarConfig;
   publisher: RtcPublisher;
-  bridge?: ChildProcessWithoutNullStreams;
-  bridgeReady?: Promise<void>;
-  bridgeResolve?: () => void;
-  bridgeReject?: (error: Error) => void;
-  bridgeAlive?: boolean;
-  bridgeFailure?: string | null;
+  conditionImage: string;
+  mediaDir: string;
+  bridge?: BridgeHandle;
   runtimeFailure?: string | null;
-  bridgeAudioEndPromise?: Promise<void> | null;
-  bridgeAudioEndResolve?: () => void;
-  bridgeAudioEndReject?: (error: Error) => void;
   closing?: boolean;
   frameQueue: string[][];
   framePump: Promise<void> | null;
@@ -47,11 +72,14 @@ interface RuntimeStartInput {
   };
 }
 
-export class SoulxRuntime {
+export class SoulxRuntime extends EventEmitter {
   private readonly sessions = new Map<string, RuntimeSession>();
   private readonly maxQueuedFrameBatches = 6;
+  private readonly idleBridges = new Map<string, BridgeHandle[]>();
 
-  constructor(private readonly config: WorkerConfig) {}
+  constructor(private readonly config: WorkerConfig) {
+    super();
+  }
 
   private markSessionFailed(session: RuntimeSession, message: string): void {
     if (session.runtimeFailure) {
@@ -59,15 +87,21 @@ export class SoulxRuntime {
     }
 
     session.runtimeFailure = message;
-    session.bridgeFailure = session.bridgeFailure ?? message;
-    session.bridgeAlive = false;
-    session.bridgeAudioEndReject?.(new Error(message));
-    session.bridgeAudioEndPromise = null;
-    session.bridgeAudioEndReject = undefined;
-    session.bridgeAudioEndResolve = undefined;
-    session.bridgeReject?.(new Error(message));
-    session.bridgeReject = undefined;
-    session.bridgeResolve = undefined;
+    if (session.bridge) {
+      session.bridge.failure = session.bridge.failure ?? message;
+      session.bridge.alive = false;
+      session.bridge.audioEndReject?.(new Error(message));
+      session.bridge.audioEndPromise = null;
+      session.bridge.audioEndReject = undefined;
+      session.bridge.audioEndResolve = undefined;
+      session.bridge.resetReject?.(new Error(message));
+      session.bridge.resetPromise = null;
+      session.bridge.resetReject = undefined;
+      session.bridge.resetResolve = undefined;
+      session.bridge.readyReject?.(new Error(message));
+      session.bridge.readyReject = undefined;
+      session.bridge.readyResolve = undefined;
+    }
     console.error(`[soulx-runtime:${session.sessionId}] ${message}`);
   }
 
@@ -75,8 +109,8 @@ export class SoulxRuntime {
     if (session.runtimeFailure) {
       throw new Error(session.runtimeFailure);
     }
-    if (session.bridgeFailure && !session.bridgeAlive) {
-      throw new Error(session.bridgeFailure);
+    if (session.bridge?.failure && !session.bridge.alive) {
+      throw new Error(session.bridge.failure);
     }
   }
 
@@ -150,10 +184,245 @@ export class SoulxRuntime {
     return this.config.SOULX_COND_IMAGE;
   }
 
+  private createBridgeMediaDir(): string {
+    const dir = path.join(os.tmpdir(), 'coherent-soulx', 'bridge', randomUUID());
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  private spawnBridge(conditionImage: string): BridgeHandle {
+    const cwd = process.env.SOULX_DIR || '/opt/SoulX-FlashHead';
+    if (!fs.existsSync(this.config.SOULX_PYTHON_BIN)) {
+      throw new Error(
+        `SOULX_PYTHON_BIN was not found at ${this.config.SOULX_PYTHON_BIN}. ` +
+          'For a laptop smoke test, set SOULX_RUNTIME_MODE=mock instead of python_bridge.',
+      );
+    }
+    if (!fs.existsSync(this.config.SOULX_BRIDGE_SCRIPT)) {
+      throw new Error(
+        `SOULX_BRIDGE_SCRIPT was not found at ${this.config.SOULX_BRIDGE_SCRIPT}. ` +
+          'Check your worker env or use SOULX_RUNTIME_MODE=mock for a local smoke test.',
+      );
+    }
+    if (!fs.existsSync(cwd)) {
+      throw new Error(
+        `SOULX working directory was not found at ${cwd}. ` +
+          'Check SOULX_DIR or use SOULX_RUNTIME_MODE=mock for a local smoke test.',
+      );
+    }
+
+    const mediaDir = this.createBridgeMediaDir();
+    const bridge = spawn(
+      this.config.SOULX_PYTHON_BIN,
+      [
+        this.config.SOULX_BRIDGE_SCRIPT,
+        '--ckpt_dir',
+        this.config.SOULX_CKPT_DIR,
+        '--wav2vec_dir',
+        this.config.SOULX_WAV2VEC_DIR,
+        '--model_type',
+        this.config.SOULX_MODEL_TYPE,
+        '--cond_image',
+        conditionImage,
+        '--base_seed',
+        String(this.config.SOULX_BASE_SEED),
+        '--use_face_crop',
+        this.config.SOULX_USE_FACE_CROP ? 'true' : 'false',
+        '--output_dir',
+        mediaDir,
+        '--chunks_per_segment',
+        String(this.config.SOULX_CHUNKS_PER_SEGMENT),
+      ],
+      {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        cwd,
+      },
+    );
+
+    const handle: BridgeHandle = {
+      id: randomUUID(),
+      conditionImage,
+      mediaDir,
+      process: bridge,
+      ready: Promise.resolve(),
+      resetPromise: null,
+      audioEndPromise: null,
+      alive: true,
+      failure: null,
+      currentSessionId: null,
+    };
+
+    handle.ready = new Promise<void>((resolve, reject) => {
+      handle.readyResolve = resolve;
+      handle.readyReject = reject;
+    });
+
+    const stdout = createInterface({ input: bridge.stdout });
+    stdout.on('line', (line) => {
+      void this.handleBridgeMessage(handle, line);
+    });
+
+    bridge.stdin.on('error', (error) => {
+      handle.alive = false;
+      handle.failure = error instanceof Error ? error.message : 'SoulX bridge stdin failed.';
+      if (handle.currentSessionId) {
+        const session = this.sessions.get(handle.currentSessionId);
+        if (session && !session.closing) {
+          this.markSessionFailed(session, handle.failure);
+        }
+      } else {
+        console.error(`[soulx-bridge:${handle.id}] stdin error: ${handle.failure}`);
+      }
+    });
+
+    bridge.stderr.on('data', (chunk) => {
+      const message = chunk.toString().trim();
+      if (message.length > 0) {
+        const target = handle.currentSessionId ?? handle.id;
+        console.error(`[soulx-bridge:${target}] ${message}`);
+      }
+    });
+
+    bridge.on('error', (error) => {
+      handle.alive = false;
+      handle.failure = error instanceof Error ? error.message : 'SoulX bridge failed to spawn.';
+      handle.readyReject?.(new Error(handle.failure));
+      handle.readyReject = undefined;
+      handle.readyResolve = undefined;
+      if (handle.currentSessionId) {
+        const session = this.sessions.get(handle.currentSessionId);
+        if (session && !session.closing) {
+          this.markSessionFailed(session, handle.failure);
+        }
+      } else {
+        console.error(`[soulx-bridge:${handle.id}] spawn error: ${handle.failure}`);
+      }
+    });
+
+    bridge.on('exit', (code, signal) => {
+      handle.alive = false;
+      const message =
+        handle.failure ?? `SoulX bridge exited code=${code ?? 'null'} signal=${signal ?? 'null'}`;
+      handle.failure = message;
+      if (handle.currentSessionId) {
+        const session = this.sessions.get(handle.currentSessionId);
+        if (session && !session.closing) {
+          this.markSessionFailed(session, message);
+          console.warn(
+            `[soulx-bridge:${handle.currentSessionId}] exited code=${code ?? 'null'} signal=${signal ?? 'null'}`,
+          );
+        }
+      }
+    });
+
+    return handle;
+  }
+
+  private async resetBridge(handle: BridgeHandle, mediaDir: string): Promise<void> {
+    handle.mediaDir = mediaDir;
+    if (!handle.alive || handle.process.stdin.destroyed || !handle.process.stdin.writable) {
+      throw new Error(handle.failure || 'SoulX bridge is no longer available.');
+    }
+    handle.resetPromise = new Promise<void>((resolve, reject) => {
+      handle.resetResolve = resolve;
+      handle.resetReject = reject;
+    });
+
+    const payload = `${JSON.stringify({
+      type: 'reset',
+      outputDir: mediaDir,
+      chunksPerSegment: this.config.SOULX_CHUNKS_PER_SEGMENT,
+    })}\n`;
+    await new Promise<void>((resolve, reject) => {
+      handle.process.stdin.write(payload, (error) => {
+        if (error) {
+          handle.alive = false;
+          handle.failure = error.message;
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+    await handle.resetPromise;
+  }
+
+  private async acquireBridge(conditionImage: string, sessionId: string, mediaDir: string): Promise<BridgeHandle> {
+    const pool = this.idleBridges.get(conditionImage);
+    const existing = pool?.shift();
+    const handle = existing ?? this.spawnBridge(conditionImage);
+    await handle.ready;
+    handle.currentSessionId = sessionId;
+    handle.failure = null;
+    handle.alive = true;
+    await this.resetBridge(handle, mediaDir);
+    return handle;
+  }
+
+  private async releaseBridge(handle: BridgeHandle): Promise<void> {
+    handle.currentSessionId = null;
+    if (!handle.alive) {
+      await this.destroyBridge(handle);
+      return;
+    }
+    const idleMediaDir = this.createBridgeMediaDir();
+    try {
+      await this.resetBridge(handle, idleMediaDir);
+    } catch {
+      await this.destroyBridge(handle);
+      return;
+    }
+    const pool = this.idleBridges.get(handle.conditionImage) ?? [];
+    pool.push(handle);
+    this.idleBridges.set(handle.conditionImage, pool);
+  }
+
+  private async destroyBridge(handle: BridgeHandle): Promise<void> {
+    handle.currentSessionId = null;
+    try {
+      if (!handle.process.stdin.destroyed && handle.process.stdin.writable) {
+        handle.process.stdin.write(`${JSON.stringify({ type: 'close' })}\n`);
+      }
+    } catch {}
+    try {
+      handle.process.kill('SIGTERM');
+    } catch {}
+    try {
+      fs.rmSync(handle.mediaDir, { recursive: true, force: true });
+    } catch {}
+  }
+
+  async prewarmCommonBridges(): Promise<void> {
+    if (this.config.SOULX_RUNTIME_MODE !== 'python_bridge') {
+      return;
+    }
+
+    const avatars: AvatarConfig[] = [
+      {},
+      { avatarId: 'default-male', gender: 'male' },
+      { avatarId: 'default-female', gender: 'female' },
+    ];
+    const uniqueConditionImages = new Set(avatars.map((avatar) => this.resolveConditionImage(avatar)));
+    for (const conditionImage of uniqueConditionImages) {
+      const pool = this.idleBridges.get(conditionImage);
+      if (pool && pool.length > 0) {
+        continue;
+      }
+      const handle = this.spawnBridge(conditionImage);
+      await handle.ready;
+      this.idleBridges.set(conditionImage, [handle]);
+      console.log(`[soulx-runtime] prewarmed bridge for ${conditionImage}`);
+    }
+  }
+
   async startSession(input: RuntimeStartInput): Promise<void> {
     if (this.sessions.has(input.sessionId)) {
       return;
     }
+
+    const mediaDir = path.join(os.tmpdir(), 'coherent-soulx', input.sessionId);
+    fs.mkdirSync(mediaDir, { recursive: true });
+    const conditionImage = this.resolveConditionImage(input.avatarConfig);
 
     const startTime = Date.now();
     const publisher = createRtcPublisher(input.publisherRtc, input.publisherOptions);
@@ -164,10 +433,9 @@ export class SoulxRuntime {
       sessionId: input.sessionId,
       avatarConfig: input.avatarConfig,
       publisher,
-      bridgeAlive: this.config.SOULX_RUNTIME_MODE !== 'python_bridge',
-      bridgeFailure: null,
+      conditionImage,
+      mediaDir,
       runtimeFailure: null,
-      bridgeAudioEndPromise: null,
       closing: false,
       frameQueue: [],
       framePump: null,
@@ -187,97 +455,42 @@ export class SoulxRuntime {
       return;
     }
 
-    const bridge = spawn(
-      this.config.SOULX_PYTHON_BIN,
-      [
-        this.config.SOULX_BRIDGE_SCRIPT,
-        '--ckpt_dir',
-        this.config.SOULX_CKPT_DIR,
-        '--wav2vec_dir',
-        this.config.SOULX_WAV2VEC_DIR,
-        '--model_type',
-        this.config.SOULX_MODEL_TYPE,
-        '--cond_image',
-        this.resolveConditionImage(input.avatarConfig),
-        '--base_seed',
-        String(this.config.SOULX_BASE_SEED),
-        '--use_face_crop',
-        this.config.SOULX_USE_FACE_CROP ? 'true' : 'false',
-      ],
-      {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        cwd: process.env.SOULX_DIR || '/opt/SoulX-FlashHead',
-      },
-    );
-
-    const readyPromise = new Promise<void>((resolve, reject) => {
-      session.bridgeResolve = resolve;
-      session.bridgeReject = reject;
-    });
-
-    session.bridge = bridge;
-    session.bridgeReady = readyPromise;
-    session.bridgeAlive = true;
-
-    const stdout = createInterface({ input: bridge.stdout });
-    stdout.on('line', (line) => {
-      void this.handleBridgeMessage(session.sessionId, line);
-    });
-
-    bridge.stdin.on('error', (error) => {
-      session.bridgeAlive = false;
-      session.bridgeFailure = error instanceof Error ? error.message : 'SoulX bridge stdin failed.';
-      if (!session.closing) {
-        this.markSessionFailed(session, session.bridgeFailure);
-      } else {
-        console.error(`[soulx-bridge:${session.sessionId}] stdin error: ${session.bridgeFailure}`);
-      }
-    });
-
-    bridge.stderr.on('data', (chunk) => {
-      const message = chunk.toString().trim();
-      if (message.length > 0) {
-        console.error(`[soulx-bridge:${session.sessionId}] ${message}`);
-      }
-    });
-
-    bridge.on('exit', (code, signal) => {
-      session.bridgeAlive = false;
-      const message =
-        session.bridgeFailure ??
-        `SoulX bridge exited code=${code ?? 'null'} signal=${signal ?? 'null'}`;
-      session.bridgeFailure = message;
-      if (this.sessions.has(session.sessionId) && !session.closing) {
-        this.markSessionFailed(session, message);
-        console.warn(
-          `[soulx-bridge:${session.sessionId}] exited code=${code ?? 'null'} signal=${signal ?? 'null'}`,
-        );
-      }
-    });
-
-    await readyPromise;
+    session.bridge = await this.acquireBridge(conditionImage, input.sessionId, mediaDir);
   }
 
-  private async handleBridgeMessage(sessionId: string, line: string): Promise<void> {
-    const session = this.sessions.get(sessionId);
-    if (!session) {
-      return;
-    }
-
+  private async handleBridgeMessage(handle: BridgeHandle, line: string): Promise<void> {
     let payload: Record<string, unknown>;
     try {
       payload = JSON.parse(line) as Record<string, unknown>;
     } catch {
-      console.warn(`[soulx-bridge:${sessionId}] non-json stdout: ${line}`);
+      const target = handle.currentSessionId ?? handle.id;
+      console.warn(`[soulx-bridge:${target}] non-json stdout: ${line}`);
       return;
     }
 
     if (payload.type === 'ready') {
-      session.bridgeResolve?.();
-      session.bridgeResolve = undefined;
-      session.bridgeReject = undefined;
-      session.bridgeAlive = true;
-      session.bridgeFailure = null;
+      handle.readyResolve?.();
+      handle.readyResolve = undefined;
+      handle.readyReject = undefined;
+      handle.alive = true;
+      handle.failure = null;
+      return;
+    }
+
+    if (payload.type === 'reset_ack') {
+      handle.resetResolve?.();
+      handle.resetPromise = null;
+      handle.resetResolve = undefined;
+      handle.resetReject = undefined;
+      return;
+    }
+
+    const sessionId = handle.currentSessionId;
+    if (!sessionId) {
+      return;
+    }
+    const session = this.sessions.get(sessionId);
+    if (!session) {
       return;
     }
 
@@ -302,11 +515,39 @@ export class SoulxRuntime {
       return;
     }
 
+    if (payload.type === 'segment') {
+      const rawPath = typeof payload.path === 'string' ? payload.path : '';
+      const fileName = rawPath ? path.basename(rawPath) : '';
+      if (!fileName) {
+        return;
+      }
+
+      const absolutePath = path.join(session.mediaDir, fileName);
+      console.log(
+        `[soulx-bridge:${sessionId}] segment ready index=${String(payload.segmentIndex)} file=${fileName} final=${String(payload.final)}`,
+      );
+      this.emit('segment', {
+        sessionId,
+        segmentIndex:
+          typeof payload.segmentIndex === 'number' && Number.isFinite(payload.segmentIndex)
+            ? payload.segmentIndex
+            : 0,
+        fileName,
+        absolutePath,
+        final: Boolean(payload.final),
+        durationSeconds:
+          typeof payload.durationSeconds === 'number' && Number.isFinite(payload.durationSeconds)
+            ? payload.durationSeconds
+            : undefined,
+      } satisfies SegmentReadyEvent);
+      return;
+    }
+
     if (payload.type === 'audio_end_ack') {
-      session.bridgeAudioEndResolve?.();
-      session.bridgeAudioEndPromise = null;
-      session.bridgeAudioEndResolve = undefined;
-      session.bridgeAudioEndReject = undefined;
+      handle.audioEndResolve?.();
+      handle.audioEndPromise = null;
+      handle.audioEndResolve = undefined;
+      handle.audioEndReject = undefined;
       return;
     }
 
@@ -412,14 +653,18 @@ export class SoulxRuntime {
     await session.publisher.publishAudioChunk(chunk, options);
 
     if (this.config.SOULX_RUNTIME_MODE === 'python_bridge') {
-      if (!session.bridge || !session.bridgeReady) {
+      if (!session.bridge) {
         throw new Error('SoulX bridge is not ready.');
       }
 
-      await session.bridgeReady;
+      await session.bridge.ready;
       this.ensureSessionHealthy(session);
-      if (!session.bridgeAlive || session.bridge.stdin.destroyed || !session.bridge.stdin.writable) {
-        throw new Error(session.bridgeFailure || 'SoulX bridge is no longer available.');
+      if (
+        !session.bridge.alive ||
+        session.bridge.process.stdin.destroyed ||
+        !session.bridge.process.stdin.writable
+      ) {
+        throw new Error(session.bridge.failure || 'SoulX bridge is no longer available.');
       }
 
       const payload = `${JSON.stringify({
@@ -431,10 +676,10 @@ export class SoulxRuntime {
       })}\n`;
 
       await new Promise<void>((resolve, reject) => {
-        session.bridge!.stdin.write(payload, (error) => {
+        session.bridge!.process.stdin.write(payload, (error) => {
           if (error) {
-            session.bridgeAlive = false;
-            session.bridgeFailure = error.message;
+            session.bridge!.alive = false;
+            session.bridge!.failure = error.message;
             this.markSessionFailed(session, error.message);
             reject(error);
             return;
@@ -461,28 +706,32 @@ export class SoulxRuntime {
       return;
     }
 
-    if (!session.bridge || !session.bridgeReady) {
+    if (!session.bridge) {
       throw new Error('SoulX bridge is not ready.');
     }
 
-    await session.bridgeReady;
+    await session.bridge.ready;
     this.ensureSessionHealthy(session);
-    if (!session.bridgeAlive || session.bridge.stdin.destroyed || !session.bridge.stdin.writable) {
-      throw new Error(session.bridgeFailure || 'SoulX bridge is no longer available.');
+    if (
+      !session.bridge.alive ||
+      session.bridge.process.stdin.destroyed ||
+      !session.bridge.process.stdin.writable
+    ) {
+      throw new Error(session.bridge.failure || 'SoulX bridge is no longer available.');
     }
 
-    if (!session.bridgeAudioEndPromise) {
-      session.bridgeAudioEndPromise = new Promise<void>((resolve, reject) => {
-        session.bridgeAudioEndResolve = resolve;
-        session.bridgeAudioEndReject = reject;
+    if (!session.bridge.audioEndPromise) {
+      session.bridge.audioEndPromise = new Promise<void>((resolve, reject) => {
+        session.bridge!.audioEndResolve = resolve;
+        session.bridge!.audioEndReject = reject;
       });
 
       const payload = `${JSON.stringify({ type: 'audio_end' })}\n`;
       await new Promise<void>((resolve, reject) => {
-        session.bridge!.stdin.write(payload, (error) => {
+        session.bridge!.process.stdin.write(payload, (error) => {
           if (error) {
-            session.bridgeAlive = false;
-            session.bridgeFailure = error.message;
+            session.bridge!.alive = false;
+            session.bridge!.failure = error.message;
             this.markSessionFailed(session, error.message);
             reject(error);
             return;
@@ -492,7 +741,7 @@ export class SoulxRuntime {
       });
     }
 
-    await session.bridgeAudioEndPromise;
+    await session.bridge.audioEndPromise;
   }
 
   async stopSession(sessionId: string): Promise<void> {
@@ -503,15 +752,6 @@ export class SoulxRuntime {
 
     session.closing = true;
 
-    if (session.bridge) {
-      if (!session.bridge.stdin.destroyed && session.bridge.stdin.writable) {
-        try {
-          session.bridge.stdin.write(`${JSON.stringify({ type: 'close' })}\n`);
-        } catch {}
-      }
-      session.bridge.kill('SIGTERM');
-    }
-
     if (session.framePump) {
       try {
         await session.framePump;
@@ -520,9 +760,29 @@ export class SoulxRuntime {
 
     await session.publisher.close();
     this.sessions.delete(sessionId);
+    if (session.bridge) {
+      await this.releaseBridge(session.bridge);
+    }
+    try {
+      fs.rmSync(session.mediaDir, { recursive: true, force: true });
+    } catch {}
   }
 
   getActiveSessionCount(): number {
     return this.sessions.size;
+  }
+
+  getMediaFilePath(sessionId: string, fileName: string): string | null {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      return null;
+    }
+
+    const safeFileName = path.basename(fileName);
+    const filePath = path.join(session.mediaDir, safeFileName);
+    if (!fs.existsSync(filePath)) {
+      return null;
+    }
+    return filePath;
   }
 }

@@ -10,6 +10,7 @@ TORCH_VERSION="${TORCH_VERSION:-2.7.1}"
 TORCHVISION_VERSION="${TORCHVISION_VERSION:-0.22.1}"
 FLASH_ATTN_VERSION="${FLASH_ATTN_VERSION:-2.8.0.post2}"
 SAGEATTENTION_VERSION="${SAGEATTENTION_VERSION:-2.2.0}"
+SOULX_RUNTIME_MODE="${SOULX_RUNTIME_MODE:-mock}"
 SOULX_START_MODE="${SOULX_START_MODE:-service}"
 SOULX_INFERENCE_SCRIPT="${SOULX_INFERENCE_SCRIPT:-inference_script_single_gpu_lite.sh}"
 SOULX_INFERENCE_COMMAND="${SOULX_INFERENCE_COMMAND:-}"
@@ -57,63 +58,71 @@ install_soulx_requirements() {
 
 echo "[bootstrap] Starting SoulX worker bootstrap..."
 
-if [[ -n "${SOULX_REPO_URL}" && ! -d "${SOULX_DIR}" ]]; then
-  echo "[bootstrap] Cloning SoulX repo from ${SOULX_REPO_URL}"
-  git clone "${SOULX_REPO_URL}" "${SOULX_DIR}"
-fi
-
-if [[ -n "${SOULX_REPO_REF}" && -d "${SOULX_DIR}" ]]; then
-  echo "[bootstrap] Checking out SoulX ref ${SOULX_REPO_REF}"
-  git -C "${SOULX_DIR}" fetch --all --tags
-  git -C "${SOULX_DIR}" checkout "${SOULX_REPO_REF}"
-fi
-
-python3 -m venv "${SOULX_VENV_DIR}"
-source "${SOULX_VENV_DIR}/bin/activate"
-
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install \
-  "torch==${TORCH_VERSION}" \
-  "torchvision==${TORCHVISION_VERSION}" \
-  --index-url "${TORCH_INDEX_URL}"
-
-if [[ -d "${SOULX_DIR}" ]]; then
-  echo "[bootstrap] Installing SoulX Python dependencies from ${SOULX_DIR}"
-
-  if [[ -f "${SOULX_DIR}/requirements.txt" ]]; then
-    install_soulx_requirements "${SOULX_DIR}/requirements.txt"
+if [[ "${SOULX_RUNTIME_MODE}" == "mock" ]]; then
+  echo "[bootstrap] SOULX_RUNTIME_MODE=mock, skipping SoulX clone/install/model bootstrap."
+else
+  if [[ -n "${SOULX_REPO_URL}" && ! -d "${SOULX_DIR}" ]]; then
+    echo "[bootstrap] Cloning SoulX repo from ${SOULX_REPO_URL}"
+    git clone "${SOULX_REPO_URL}" "${SOULX_DIR}"
   fi
 
-  python -m pip install ninja "huggingface_hub[cli]"
-
-  if [[ "${INSTALL_FLASH_ATTN:-true}" == "true" ]]; then
-    python -m pip install "flash_attn==${FLASH_ATTN_VERSION}" --no-build-isolation
+  if [[ -n "${SOULX_REPO_REF}" && -d "${SOULX_DIR}" ]]; then
+    echo "[bootstrap] Checking out SoulX ref ${SOULX_REPO_REF}"
+    git -C "${SOULX_DIR}" fetch --all --tags
+    git -C "${SOULX_DIR}" checkout "${SOULX_REPO_REF}"
   fi
 
-  if [[ "${INSTALL_SAGEATTENTION:-false}" == "true" ]]; then
-    python -m pip install "sageattention==${SAGEATTENTION_VERSION}" --no-build-isolation
-  fi
+  python3 -m venv "${SOULX_VENV_DIR}"
+  source "${SOULX_VENV_DIR}/bin/activate"
 
-  if [[ "${INSTALL_SOULX_EDITABLE}" == "true" && -f "${SOULX_DIR}/pyproject.toml" ]]; then
-    python -m pip install -e "${SOULX_DIR}"
-  fi
+  python -m pip install --upgrade pip setuptools wheel
+  python -m pip install \
+    "torch==${TORCH_VERSION}" \
+    "torchvision==${TORCHVISION_VERSION}" \
+    --index-url "${TORCH_INDEX_URL}"
 
-  if [[ -n "${SOULX_MODEL_ID:-}" ]]; then
-    MODEL_TARGET_DIR="${SOULX_MODEL_TARGET_DIR:-${SOULX_DIR}/models/SoulX-FlashHead-1_3B}"
-    MODEL_EXCLUDE_PATTERNS="${SOULX_MODEL_EXCLUDE_PATTERNS:-Model_Pro/*}"
-    download_hf_repo "${SOULX_MODEL_ID}" "${MODEL_TARGET_DIR}" "${MODEL_EXCLUDE_PATTERNS}"
-  fi
+  if [[ -d "${SOULX_DIR}" ]]; then
+    echo "[bootstrap] Installing SoulX Python dependencies from ${SOULX_DIR}"
 
-  if [[ -n "${SOULX_WAV2VEC_MODEL_ID:-}" ]]; then
-    WAV2VEC_TARGET_DIR="${SOULX_WAV2VEC_TARGET_DIR:-${SOULX_DIR}/models/wav2vec2-base-960h}"
-    download_hf_repo "${SOULX_WAV2VEC_MODEL_ID}" "${WAV2VEC_TARGET_DIR}"
+    if [[ -f "${SOULX_DIR}/requirements.txt" ]]; then
+      install_soulx_requirements "${SOULX_DIR}/requirements.txt"
+    fi
+
+    python -m pip install ninja "huggingface_hub[cli]"
+
+    if [[ "${INSTALL_FLASH_ATTN:-true}" == "true" ]]; then
+      python -m pip install "flash_attn==${FLASH_ATTN_VERSION}" --no-build-isolation
+    fi
+
+    if [[ "${INSTALL_SAGEATTENTION:-false}" == "true" ]]; then
+      python -m pip install "sageattention==${SAGEATTENTION_VERSION}" --no-build-isolation
+    fi
+
+    if [[ "${INSTALL_SOULX_EDITABLE}" == "true" && -f "${SOULX_DIR}/pyproject.toml" ]]; then
+      python -m pip install -e "${SOULX_DIR}"
+    fi
+
+    if [[ -n "${SOULX_MODEL_ID:-}" ]]; then
+      MODEL_TARGET_DIR="${SOULX_MODEL_TARGET_DIR:-${SOULX_DIR}/models/SoulX-FlashHead-1_3B}"
+      MODEL_EXCLUDE_PATTERNS="${SOULX_MODEL_EXCLUDE_PATTERNS:-Model_Pro/*}"
+      download_hf_repo "${SOULX_MODEL_ID}" "${MODEL_TARGET_DIR}" "${MODEL_EXCLUDE_PATTERNS}"
+    fi
+
+    if [[ -n "${SOULX_WAV2VEC_MODEL_ID:-}" ]]; then
+      WAV2VEC_TARGET_DIR="${SOULX_WAV2VEC_TARGET_DIR:-${SOULX_DIR}/models/wav2vec2-base-960h}"
+      download_hf_repo "${SOULX_WAV2VEC_MODEL_ID}" "${WAV2VEC_TARGET_DIR}"
+    fi
   fi
 fi
 
 export WORKER_BROWSER_EXECUTABLE_PATH="${WORKER_BROWSER_EXECUTABLE_PATH:-/usr/bin/google-chrome}"
 export WORKER_RTC_PUBLISHER="${WORKER_RTC_PUBLISHER:-browser}"
-export PATH="${SOULX_VENV_DIR}/bin:${PATH}"
-export PYTHONPATH="${SOULX_DIR}:${PYTHONPATH:-}"
+if [[ -d "${SOULX_VENV_DIR}" ]]; then
+  export PATH="${SOULX_VENV_DIR}/bin:${PATH}"
+fi
+if [[ -d "${SOULX_DIR}" ]]; then
+  export PYTHONPATH="${SOULX_DIR}:${PYTHONPATH:-}"
+fi
 
 echo "[bootstrap] Using browser publisher executable: ${WORKER_BROWSER_EXECUTABLE_PATH}"
 
