@@ -120,6 +120,14 @@ export type ClientToWorkerMessage =
       format?: PcmFormat;
     }
   | {
+      type: 'audio.append.binary';
+      sequence: number;
+      sampleRate: number;
+      channels: number;
+      format?: PcmFormat;
+      byteLength: number;
+    }
+  | {
       type: 'audio.end';
     }
   | {

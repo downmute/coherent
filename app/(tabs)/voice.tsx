@@ -188,6 +188,7 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
     const [remoteRtcConnected, setRemoteRtcConnected] = useState(false);
     const [videoSegments, setVideoSegments] = useState<AvatarVideoSegment[]>([]);
     const [videoSessionError, setVideoSessionError] = useState<string | null>(null);
+    const isFullscreenVideoCall = isVideoExperience && sessionActive;
 
     // Download State
     const [parakeetPaths, setParakeetPaths] = useState<Record<string, string> | null>(null);
@@ -1314,6 +1315,22 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
         }
     };
 
+    const handleRemotePlaybackFinished = () => {
+        setIsPlaying(false);
+        isPlayingRef.current = false;
+        activeSourcesRef.current = 0;
+
+        const isActuallyDone =
+            !isLLMGeneratingRef.current &&
+            ttsQueue.current.length === 0 &&
+            !isProcessingQueue.current;
+
+        if (isActuallyDone && sessionActiveRef.current && !isRecordingRef.current && !isStartingRef.current) {
+            console.log('[Auto-Listen] Remote segment playback finished. Restarting...');
+            startRecordingSafe();
+        }
+    };
+
     const playAudioChunk = async (text: string) => {
         const normalizedText = ensureTerminalPunctuation(
             capitalizeSentenceStart(text.replace(/\s+/g, ' ').trim())
@@ -1358,6 +1375,7 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
 
             let ambientStarted = false;
             let receivedChunkCount = 0;
+            let remoteChunkSendChain: Promise<void> = Promise.resolve();
             const maybeStartAmbientListener = () => {
                 if (ambientStarted) return;
                 if (!sessionActiveRef.current) return;
@@ -1376,10 +1394,14 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
 
             const onNext = async (audioVec: Float32Array) => {
                 receivedChunkCount++;
+                const stableAudioVec = new Float32Array(audioVec);
                 let playedRemotely = false;
                 if (isVideoExperience && avatarSessionClientRef.current?.isReady()) {
+                    remoteChunkSendChain = remoteChunkSendChain.then(async () => {
+                        await avatarSessionClientRef.current?.appendFloat32Chunk(stableAudioVec, 24000, 1);
+                    });
                     try {
-                        await avatarSessionClientRef.current.appendFloat32Chunk(audioVec, 24000, 1);
+                        await remoteChunkSendChain;
                         playedRemotely = true;
                     } catch (error) {
                         const message = error instanceof Error ? error.message : String(error);
@@ -1390,7 +1412,7 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
                 }
 
                 if (!playedRemotely) {
-                    scheduleAudioVector(audioVec);
+                    scheduleAudioVector(stableAudioVec);
                 }
                 maybeStartAmbientListener();
             };
@@ -1468,6 +1490,7 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
             }
 
             if (isVideoExperience && avatarSessionClientRef.current?.isReady()) {
+                await remoteChunkSendChain;
                 avatarSessionClientRef.current?.signalAudioEnd();
             }
         } catch (error) {
@@ -1531,21 +1554,23 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
 
     return (
         <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-            <View style={styles.container}>
+            <View style={[styles.container, isFullscreenVideoCall && styles.containerFullscreenVideo]}>
 
                 {/* Header */}
-                <View style={styles.header}>
-                    <Text style={styles.headerTitle}>
-                        {sessionActive
-                            ? SCENARIOS.find(s => s.id === selectedScenario)?.label || (isVideoExperience ? 'Video Call' : 'Voice Chat')
-                            : (isVideoExperience ? 'Video Practice' : 'Practice Mode')}
-                    </Text>
-                    {sessionActive && (
-                        <TouchableOpacity onPress={handleEndSession}>
-                            <Text style={styles.endButton}>End</Text>
-                        </TouchableOpacity>
-                    )}
-                </View>
+                {!isFullscreenVideoCall && (
+                    <View style={styles.header}>
+                        <Text style={styles.headerTitle}>
+                            {sessionActive
+                                ? SCENARIOS.find(s => s.id === selectedScenario)?.label || (isVideoExperience ? 'Video Call' : 'Voice Chat')
+                                : (isVideoExperience ? 'Video Practice' : 'Practice Mode')}
+                        </Text>
+                        {sessionActive && (
+                            <TouchableOpacity onPress={handleEndSession}>
+                                <Text style={styles.endButton}>End</Text>
+                            </TouchableOpacity>
+                        )}
+                    </View>
+                )}
 
                 {/* Content Logic */}
                 {!sessionActive ? (
@@ -1587,7 +1612,7 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
                     isVideoExperience ? (
                         <View style={styles.videoSessionContainer}>
                             <View style={styles.videoStage}>
-                                <View style={styles.videoStageHeader}>
+                                <View style={styles.videoStageTopBar}>
                                     <Text style={styles.videoStageTitle}>Avatar Call</Text>
                                     <View style={styles.videoStageStatus}>
                                         <View style={styles.videoStageStatusDot} />
@@ -1606,35 +1631,34 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
                                         sessionId={remoteSession?.sessionId ?? null}
                                         segments={videoSegments}
                                         onConnectedChange={handleRemoteRtcConnected}
+                                        onPlaybackFinished={handleRemotePlaybackFinished}
                                         onError={handleRemoteRtcError}
                                     />
+                                </View>
 
-                                    <View style={styles.videoStageOverlay}>
-                                        <Text style={styles.videoStageOverlayLabel}>
-                                            {selectedScenario ? SCENARIOS.find(s => s.id === selectedScenario)?.label || 'Video Call' : 'Video Call'}
-                                        </Text>
-                                        <Text style={styles.videoStageOverlaySubLabel}>
-                                            {remoteSession
-                                                ? (remoteRtcConnected
-                                                    ? 'SoulX segment stream attached. Avatar audio/video is coming from worker-rendered MP4 chunks.'
-                                                    : 'Worker session is live. Waiting for the first SoulX video segment...')
-                                                : 'Voice agent loop active, video stream will attach when the backend session starts.'}
-                                        </Text>
-                                    </View>
+                                <View style={styles.videoStageBottomBar}>
+                                    <Text style={styles.videoStageOverlayLabel}>
+                                        {selectedScenario ? SCENARIOS.find(s => s.id === selectedScenario)?.label || 'Video Call' : 'Video Call'}
+                                    </Text>
+                                    <Text style={styles.videoStageOverlaySubLabel}>
+                                        {remoteSession
+                                            ? (remoteRtcConnected
+                                                ? 'SoulX segment stream attached. Avatar audio and video are coming from worker-rendered MP4 chunks.'
+                                                : 'Worker session is live. Waiting for the first SoulX video segment...')
+                                            : 'Voice agent loop active, video stream will attach when the backend session starts.'}
+                                    </Text>
+                                    <Text style={styles.videoStageStateText}>
+                                        {activeSourcesRef.current > 0 || isPlaying
+                                            ? 'Speaking...'
+                                            : (isRecording
+                                                ? 'Listening...'
+                                                : (llm.isGenerating ? 'Thinking...' : 'Waiting...'))}
+                                    </Text>
+                                    {videoSessionError && (
+                                        <Text style={styles.videoStageErrorText}>{videoSessionError}</Text>
+                                    )}
                                 </View>
                             </View>
-
-                            <Text style={styles.statusText}>
-                                {activeSourcesRef.current > 0 || isPlaying
-                                    ? 'Speaking...'
-                                    : (isRecording
-                                        ? 'Listening...'
-                                        : (llm.isGenerating ? 'Thinking...' : 'Waiting...'))}
-                            </Text>
-                            {videoSessionError && (
-                                <Text style={styles.transcriptionPreview}>{videoSessionError}</Text>
-                            )}
-                            {isRecording && <Text style={styles.transcriptionPreview}>...</Text>}
                         </View>
                     ) : (
                         <View style={styles.orbContainer}>
@@ -1665,9 +1689,9 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
 
                 {/* Bottom Controls (Only in Active Mode) */}
                 {sessionActive && (
-                    <View style={styles.controls}>
+                    <View style={[styles.controls, isFullscreenVideoCall && styles.controlsFullscreenVideo]}>
                         <TouchableOpacity
-                            style={styles.endLimitButton}
+                            style={[styles.endLimitButton, isFullscreenVideoCall && styles.endLimitButtonFullscreenVideo]}
                             onPress={handleEndSession}
                         >
                             <Text style={styles.endLimitText}>End Session</Text>
@@ -1684,6 +1708,10 @@ const styles = StyleSheet.create({
         flex: 1,
         backgroundColor: '#FFF',
         paddingTop: Platform.OS === 'android' ? 40 : 60,
+    },
+    containerFullscreenVideo: {
+        backgroundColor: '#000',
+        paddingTop: 0,
     },
     loaderContainer: {
         flex: 1,
@@ -1885,33 +1913,23 @@ const styles = StyleSheet.create({
     },
     videoSessionContainer: {
         flex: 1,
-        justifyContent: 'center',
-        alignItems: 'center',
-        paddingHorizontal: 20,
-        marginBottom: 28,
+        width: '100%',
+        backgroundColor: '#000',
     },
     videoStage: {
+        flex: 1,
         width: '100%',
-        maxWidth: 420,
-        borderRadius: 28,
-        backgroundColor: '#08111f',
+        backgroundColor: '#000',
         overflow: 'hidden',
-        borderWidth: 1,
-        borderColor: '#16324f',
-        shadowColor: '#04111d',
-        shadowOffset: { width: 0, height: 16 },
-        shadowOpacity: 0.24,
-        shadowRadius: 24,
-        elevation: 12,
     },
-    videoStageHeader: {
+    videoStageTopBar: {
         paddingHorizontal: 18,
-        paddingVertical: 14,
+        paddingTop: Platform.OS === 'android' ? 48 : 68,
+        paddingBottom: 16,
         flexDirection: 'row',
         alignItems: 'center',
         justifyContent: 'space-between',
-        borderBottomWidth: 1,
-        borderBottomColor: 'rgba(127, 210, 255, 0.12)',
+        backgroundColor: '#000',
     },
     videoStageTitle: {
         color: '#f3f8ff',
@@ -1935,20 +1953,16 @@ const styles = StyleSheet.create({
         fontWeight: '600',
     },
     videoStageCanvas: {
-        minHeight: 440,
+        flex: 1,
         justifyContent: 'center',
         alignItems: 'center',
-        backgroundColor: '#0b1625',
+        backgroundColor: '#000',
     },
-    videoStageOverlay: {
-        position: 'absolute',
-        left: 18,
-        right: 18,
-        bottom: 18,
-        paddingHorizontal: 14,
-        paddingVertical: 12,
-        borderRadius: 18,
-        backgroundColor: 'rgba(4, 11, 18, 0.56)',
+    videoStageBottomBar: {
+        paddingHorizontal: 18,
+        paddingTop: 16,
+        paddingBottom: 108,
+        backgroundColor: '#000',
     },
     videoStageOverlayLabel: {
         color: '#f4fbff',
@@ -1958,6 +1972,18 @@ const styles = StyleSheet.create({
     videoStageOverlaySubLabel: {
         marginTop: 4,
         color: '#abc4de',
+        fontSize: 13,
+        lineHeight: 18,
+    },
+    videoStageStateText: {
+        marginTop: 12,
+        color: '#f4fbff',
+        fontSize: 15,
+        fontWeight: '600',
+    },
+    videoStageErrorText: {
+        marginTop: 10,
+        color: '#ffb4b4',
         fontSize: 13,
         lineHeight: 18,
     },
@@ -2006,11 +2032,26 @@ const styles = StyleSheet.create({
         justifyContent: 'center',
         marginTop: 20,
     },
+    controlsFullscreenVideo: {
+        position: 'absolute',
+        left: 0,
+        right: 0,
+        bottom: Platform.OS === 'android' ? 22 : 34,
+        marginTop: 0,
+        zIndex: 20,
+        elevation: 20,
+    },
     endLimitButton: {
         backgroundColor: '#FF3B30',
         paddingVertical: 12,
         paddingHorizontal: 24,
         borderRadius: 24,
+    },
+    endLimitButtonFullscreenVideo: {
+        backgroundColor: 'rgba(255, 59, 48, 0.92)',
+        paddingHorizontal: 28,
+        paddingVertical: 14,
+        borderRadius: 999,
     },
     endLimitText: {
         color: 'white',

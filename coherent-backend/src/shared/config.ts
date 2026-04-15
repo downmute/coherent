@@ -66,6 +66,7 @@ const workerSchema = commonSchema.extend({
   SOULX_RUNTIME_MODE: z.enum(['mock', 'python_bridge']).default('mock'),
   SOULX_DELIVERY_MODE: z.enum(['rtc_frames', 'segment_mp4']).default('segment_mp4'),
   SOULX_CHUNKS_PER_SEGMENT: z.coerce.number().int().positive().default(3),
+  SOULX_PREWARM_MAX_BRIDGES: z.coerce.number().int().min(0).default(2),
   SOULX_CKPT_DIR: z.string().default('/opt/SoulX-FlashHead/models/SoulX-FlashHead-1_3B'),
   SOULX_WAV2VEC_DIR: z.string().default('/opt/SoulX-FlashHead/models/wav2vec2-base-960h'),
   SOULX_MODEL_TYPE: z.enum(['lite', 'pro']).default('lite'),

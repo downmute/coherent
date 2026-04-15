@@ -47,10 +47,22 @@ def emit(payload):
 
 
 def decode_pcm(base64_chunk, sample_rate, channels, pcm_format, target_sample_rate):
-    raw = base64.b64decode(base64_chunk)
+    normalized = str(base64_chunk).strip()
+    normalized = normalized.replace("-", "+").replace("_", "/")
+    padding = (-len(normalized)) % 4
+    if padding:
+        normalized += "=" * padding
+
+    raw = base64.b64decode(normalized)
     if pcm_format == "f32le":
+      remainder = len(raw) % 4
+      if remainder:
+          raw = raw[: len(raw) - remainder]
       audio = np.frombuffer(raw, dtype="<f4")
     else:
+      remainder = len(raw) % 2
+      if remainder:
+          raw = raw[: len(raw) - remainder]
       audio = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
 
     if channels > 1:
@@ -302,7 +314,16 @@ def main():
                 sample_rate,
             )
         except Exception as error:
-            emit({"type": "error", "message": f"Failed to decode PCM chunk: {error}"})
+            raw_pcm = str(message.get("pcmBase64", ""))
+            normalized = raw_pcm.strip().replace("-", "+").replace("_", "/")
+            emit({
+                "type": "error",
+                "message": (
+                    f"Failed to decode PCM chunk seq={message.get('sequence')} "
+                    f"rawLen={len(raw_pcm)} normalizedLen={len(normalized)} "
+                    f"mod4={len(normalized) % 4}: {error}"
+                ),
+            })
             continue
 
         stream_state["pending_audio"] = np.concatenate([stream_state["pending_audio"], chunk])

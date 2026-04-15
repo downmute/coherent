@@ -142,15 +142,15 @@ Response body:
   "workerWsUrl": "ws://127.0.0.1:8090/ws",
   "workerToken": "signed-token",
   "rtcCredentials": {
-    "provider": "cloudflare",
-    "roomId": "meeting-uuid",
+    "provider": "mock",
+    "roomId": "session-uuid",
     "role": "subscriber",
-    "token": "participant-token",
+    "token": "mock-token",
     "endpoint": "https://rtc.example.com",
-    "appId": "cloudflare-app-id",
-    "meetingId": "meeting-uuid",
-    "participantId": "participant-id",
-    "presetName": "group_call_participant"
+    "appId": null,
+    "meetingId": null,
+    "participantId": null,
+    "presetName": null
   },
   "status": "assigned"
 }

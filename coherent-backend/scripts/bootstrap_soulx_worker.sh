@@ -18,10 +18,47 @@ SOULX_PRESTART_COMMAND="${SOULX_PRESTART_COMMAND:-}"
 INSTALL_SOULX_EDITABLE="${INSTALL_SOULX_EDITABLE:-false}"
 WORKER_START_COMMAND="${WORKER_START_COMMAND:-npm run start:worker}"
 
+ensure_python_env() {
+  if [[ -x "${SOULX_VENV_DIR}/bin/python" ]]; then
+    echo "[bootstrap] Reusing existing virtualenv at ${SOULX_VENV_DIR}"
+  else
+    echo "[bootstrap] Creating virtualenv at ${SOULX_VENV_DIR}"
+    python3 -m venv "${SOULX_VENV_DIR}"
+  fi
+
+  # Some restarts previously re-ran ensurepip implicitly via venv recreation and got stuck.
+  # Only bootstrap pip if it is actually missing from the environment.
+  if [[ ! -x "${SOULX_VENV_DIR}/bin/pip" ]]; then
+    echo "[bootstrap] Bootstrapping pip inside ${SOULX_VENV_DIR}"
+    "${SOULX_VENV_DIR}/bin/python" -m ensurepip --upgrade || true
+  fi
+
+  # shellcheck disable=SC1091
+  source "${SOULX_VENV_DIR}/bin/activate"
+}
+
+should_skip_download() {
+  local target_dir="$1"
+  if [[ ! -d "${target_dir}" ]]; then
+    return 1
+  fi
+
+  if find "${target_dir}" -mindepth 1 -maxdepth 2 | read -r _; then
+    return 0
+  fi
+
+  return 1
+}
+
 download_hf_repo() {
   local repo_id="$1"
   local target_dir="$2"
   local exclude_patterns="${3:-}"
+
+  if should_skip_download "${target_dir}"; then
+    echo "[bootstrap] Reusing existing model assets in ${target_dir}"
+    return
+  fi
 
   mkdir -p "${target_dir}"
   echo "[bootstrap] Downloading model ${repo_id} to ${target_dir}"
@@ -72,8 +109,7 @@ else
     git -C "${SOULX_DIR}" checkout "${SOULX_REPO_REF}"
   fi
 
-  python3 -m venv "${SOULX_VENV_DIR}"
-  source "${SOULX_VENV_DIR}/bin/activate"
+  ensure_python_env
 
   python -m pip install --upgrade pip setuptools wheel
   python -m pip install \

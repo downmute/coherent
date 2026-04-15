@@ -1,3 +1,5 @@
+import { Buffer } from 'buffer';
+
 export interface AvatarRtcCredentials {
     provider: 'cloudflare' | 'mock';
     roomId: string;
@@ -26,6 +28,9 @@ export interface AvatarVideoSegment {
     durationSeconds?: number;
 }
 
+const MAX_REMOTE_AUDIO_SAMPLES_PER_MESSAGE = 4096;
+const SESSION_READY_TIMEOUT_MS = 120000;
+
 type AvatarClientEvent =
     | { type: 'session.ready'; sessionId: string; provider: string }
     | { type: 'audio.ack'; sessionId: string; sequence: number; totalAudioBytes: number; estimatedFrames: number }
@@ -41,6 +46,11 @@ export interface AvatarSessionClientCallbacks {
     onError?: (message: string) => void;
     onAck?: (event: Extract<AvatarClientEvent, { type: 'audio.ack' }>) => void;
     onVideoSegment?: (segment: AvatarVideoSegment) => void;
+}
+
+interface PendingAck {
+    resolve: () => void;
+    reject: (error: Error) => void;
 }
 
 interface AvatarSessionErrorPayload {
@@ -86,25 +96,31 @@ function trimTrailingSlash(value: string): string {
 }
 
 function encodeBase64FromBytes(bytes: Uint8Array): string {
-    if (typeof btoa === 'function') {
-        let binary = '';
-        for (let index = 0; index < bytes.length; index += 1) {
-            binary += String.fromCharCode(bytes[index]!);
-        }
-        return btoa(binary);
-    }
+    return Buffer.from(bytes).toString('base64');
+}
 
-    const maybeBuffer = (globalThis as { Buffer?: { from: (input: Uint8Array) => { toString: (encoding: string) => string } } }).Buffer;
-    if (maybeBuffer?.from) {
-        return maybeBuffer.from(bytes).toString('base64');
+function assertPlausibleBase64Length(base64: string): string {
+    const normalized = base64.trim();
+    if (normalized.length % 4 === 1) {
+        throw new Error(`Generated invalid base64 payload length ${normalized.length}.`);
     }
-
-    throw new Error('Base64 encoding is not supported in this runtime.');
+    return normalized;
 }
 
 export function encodeFloat32ToBase64(audio: Float32Array): string {
     const bytes = new Uint8Array(audio.buffer, audio.byteOffset, audio.byteLength);
     return encodeBase64FromBytes(bytes);
+}
+
+function encodeFloat32ToS16leBytes(audio: Float32Array): Uint8Array {
+    const bytes = new Uint8Array(audio.length * 2);
+    const view = new DataView(bytes.buffer);
+    for (let index = 0; index < audio.length; index += 1) {
+        const sample = Math.max(-1, Math.min(1, audio[index] ?? 0));
+        const scaled = sample < 0 ? Math.round(sample * 0x8000) : Math.round(sample * 0x7fff);
+        view.setInt16(index * 2, scaled, true);
+    }
+    return bytes;
 }
 
 export async function createAvatarSession(
@@ -149,6 +165,7 @@ export class AvatarSessionClient {
     private sequence = 0;
     private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
     private openPromise: Promise<void> | null = null;
+    private readonly pendingAcks = new Map<number, PendingAck>();
 
     constructor(
         private readonly session: AvatarSessionResponse,
@@ -169,6 +186,10 @@ export class AvatarSessionClient {
 
             let settled = false;
             const fail = (message: string) => {
+                for (const waiter of this.pendingAcks.values()) {
+                    waiter.reject(new Error(message));
+                }
+                this.pendingAcks.clear();
                 if (!settled) {
                     settled = true;
                     reject(new Error(message));
@@ -210,6 +231,11 @@ export class AvatarSessionClient {
                 }
 
                 if (payload.type === 'audio.ack') {
+                    const waiter = this.pendingAcks.get(payload.sequence);
+                    if (waiter) {
+                        this.pendingAcks.delete(payload.sequence);
+                        waiter.resolve();
+                    }
                     this.callbacks.onAck?.(payload);
                     return;
                 }
@@ -243,13 +269,17 @@ export class AvatarSessionClient {
                 this.stopHeartbeat();
                 this.ready = false;
                 this.socket = null;
+                for (const waiter of this.pendingAcks.values()) {
+                    waiter.reject(new Error('Worker WebSocket closed before audio chunk was acknowledged.'));
+                }
+                this.pendingAcks.clear();
                 this.callbacks.onStopped?.();
                 if (!settled) {
                     settled = true;
                     reject(new Error('Worker WebSocket closed before session became ready.'));
                 }
             };
-        }), 30000, 'Timed out waiting 30s for worker session.ready.');
+        }), SESSION_READY_TIMEOUT_MS, `Timed out waiting ${Math.round(SESSION_READY_TIMEOUT_MS / 1000)}s for worker session.ready.`);
 
         return this.openPromise;
     }
@@ -283,17 +313,35 @@ export class AvatarSessionClient {
             throw new Error('Avatar worker session is not ready.');
         }
 
-        this.sequence += 1;
-        this.socket.send(
-            JSON.stringify({
-                type: 'audio.append',
-                sequence: this.sequence,
-                pcmBase64: encodeFloat32ToBase64(audio),
-                sampleRate,
-                channels,
-                format: 'f32le',
-            }),
-        );
+        for (let start = 0; start < audio.length; start += MAX_REMOTE_AUDIO_SAMPLES_PER_MESSAGE) {
+            const chunk = audio.subarray(start, Math.min(audio.length, start + MAX_REMOTE_AUDIO_SAMPLES_PER_MESSAGE));
+            if (chunk.length === 0) {
+                continue;
+            }
+
+            this.sequence += 1;
+            const s16leBytes = encodeFloat32ToS16leBytes(chunk);
+            const sequence = this.sequence;
+            const ackPromise = new Promise<void>((resolve, reject) => {
+                this.pendingAcks.set(sequence, { resolve, reject });
+            });
+            this.socket.send(
+                JSON.stringify({
+                    type: 'audio.append.binary',
+                    sequence,
+                    sampleRate,
+                    channels,
+                    format: 's16le',
+                    byteLength: s16leBytes.byteLength,
+                }),
+            );
+            const buffer = s16leBytes.buffer.slice(
+                s16leBytes.byteOffset,
+                s16leBytes.byteOffset + s16leBytes.byteLength,
+            );
+            this.socket.send(buffer);
+            await ackPromise;
+        }
     }
 
     signalAudioEnd(): void {
@@ -306,6 +354,10 @@ export class AvatarSessionClient {
         this.stopHeartbeat();
         this.ready = false;
         this.sequence = 0;
+        for (const waiter of this.pendingAcks.values()) {
+            waiter.reject(new Error('Avatar session stopped before audio chunk was acknowledged.'));
+        }
+        this.pendingAcks.clear();
 
         if (this.socket?.readyState === WebSocket.OPEN) {
             try {

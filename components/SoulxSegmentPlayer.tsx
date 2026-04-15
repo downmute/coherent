@@ -8,6 +8,7 @@ interface SoulxSegmentPlayerProps {
     sessionId: string | null;
     segments: AvatarVideoSegment[];
     onConnectedChange?: (connected: boolean) => void;
+    onPlaybackFinished?: () => void;
     onError?: (message: string) => void;
 }
 
@@ -15,6 +16,7 @@ export function SoulxSegmentPlayer({
     sessionId,
     segments,
     onConnectedChange,
+    onPlaybackFinished,
     onError,
 }: SoulxSegmentPlayerProps) {
     const [currentIndex, setCurrentIndex] = useState(0);
@@ -97,7 +99,11 @@ export function SoulxSegmentPlayer({
         }
 
         if (status.didJustFinish) {
+            const finishedSegment = currentSegment;
             setCurrentIndex((value) => value + 1);
+            if (finishedSegment?.final) {
+                onPlaybackFinished?.();
+            }
         }
     };
 
@@ -108,7 +114,7 @@ export function SoulxSegmentPlayer({
                     key={localUris[currentSegment.url] ?? currentSegment.url}
                     style={styles.video}
                     source={{ uri: localUris[currentSegment.url] ?? currentSegment.url }}
-                    resizeMode={ResizeMode.COVER}
+                    resizeMode={ResizeMode.CONTAIN}
                     shouldPlay
                     isLooping={false}
                     useNativeControls={false}

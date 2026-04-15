@@ -76,6 +76,7 @@ export class SoulxRuntime extends EventEmitter {
   private readonly sessions = new Map<string, RuntimeSession>();
   private readonly maxQueuedFrameBatches = 6;
   private readonly idleBridges = new Map<string, BridgeHandle[]>();
+  private readonly warmingBridges = new Map<string, Promise<void>>();
 
   constructor(private readonly config: WorkerConfig) {
     super();
@@ -347,10 +348,43 @@ export class SoulxRuntime extends EventEmitter {
     await handle.resetPromise;
   }
 
+  private async ensureIdleBridge(conditionImage: string): Promise<void> {
+    const pool = this.idleBridges.get(conditionImage);
+    if (pool && pool.length > 0) {
+      return;
+    }
+
+    const warming = this.warmingBridges.get(conditionImage);
+    if (warming) {
+      await warming;
+      return;
+    }
+
+    const warmup = (async () => {
+      const handle = this.spawnBridge(conditionImage);
+      await handle.ready;
+      const nextPool = this.idleBridges.get(conditionImage) ?? [];
+      nextPool.push(handle);
+      this.idleBridges.set(conditionImage, nextPool);
+      console.log(`[soulx-runtime] prewarmed bridge for ${conditionImage}`);
+    })();
+
+    this.warmingBridges.set(conditionImage, warmup);
+    try {
+      await warmup;
+    } finally {
+      this.warmingBridges.delete(conditionImage);
+    }
+  }
+
   private async acquireBridge(conditionImage: string, sessionId: string, mediaDir: string): Promise<BridgeHandle> {
     const pool = this.idleBridges.get(conditionImage);
-    const existing = pool?.shift();
-    const handle = existing ?? this.spawnBridge(conditionImage);
+    let handle = pool?.shift();
+    if (!handle) {
+      await this.ensureIdleBridge(conditionImage);
+      handle = this.idleBridges.get(conditionImage)?.shift();
+    }
+    handle ??= this.spawnBridge(conditionImage);
     await handle.ready;
     handle.currentSessionId = sessionId;
     handle.failure = null;
@@ -398,20 +432,12 @@ export class SoulxRuntime extends EventEmitter {
     }
 
     const avatars: AvatarConfig[] = [
-      {},
       { avatarId: 'default-male', gender: 'male' },
       { avatarId: 'default-female', gender: 'female' },
     ];
-    const uniqueConditionImages = new Set(avatars.map((avatar) => this.resolveConditionImage(avatar)));
-    for (const conditionImage of uniqueConditionImages) {
-      const pool = this.idleBridges.get(conditionImage);
-      if (pool && pool.length > 0) {
-        continue;
-      }
-      const handle = this.spawnBridge(conditionImage);
-      await handle.ready;
-      this.idleBridges.set(conditionImage, [handle]);
-      console.log(`[soulx-runtime] prewarmed bridge for ${conditionImage}`);
+    const uniqueConditionImages = [...new Set(avatars.map((avatar) => this.resolveConditionImage(avatar)))];
+    for (const conditionImage of uniqueConditionImages.slice(0, this.config.SOULX_PREWARM_MAX_BRIDGES)) {
+      await this.ensureIdleBridge(conditionImage);
     }
   }
 
@@ -553,6 +579,10 @@ export class SoulxRuntime extends EventEmitter {
 
     if (payload.type === 'error') {
       const message = typeof payload.message === 'string' ? payload.message : 'Unknown SoulX bridge error.';
+      if (message.startsWith('Failed to decode PCM chunk')) {
+        console.warn(`[soulx-runtime:${sessionId}] ${message}`);
+        return;
+      }
       this.markSessionFailed(session, message);
       return;
     }
@@ -637,7 +667,13 @@ export class SoulxRuntime extends EventEmitter {
   async appendAudio(
     sessionId: string,
     chunk: Buffer,
-    options: { sampleRate: number; channels: number; format: 'f32le' | 's16le' },
+    options: {
+      sequence?: number;
+      pcmBase64?: string;
+      sampleRate: number;
+      channels: number;
+      format: 'f32le' | 's16le';
+    },
   ): Promise<{ totalAudioBytes: number; estimatedFrames: number }> {
     const session = this.sessions.get(sessionId);
     if (!session) {
@@ -669,7 +705,8 @@ export class SoulxRuntime extends EventEmitter {
 
       const payload = `${JSON.stringify({
         type: 'audio_chunk',
-        pcmBase64: chunk.toString('base64'),
+        sequence: options.sequence ?? null,
+        pcmBase64: options.pcmBase64 ?? chunk.toString('base64'),
         sampleRate: options.sampleRate,
         channels: options.channels,
         format: options.format,

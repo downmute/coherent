@@ -14,7 +14,7 @@
     }
   ],
   "vars": {
-    "RTC_PROVIDER": "cloudflare",
+    "RTC_PROVIDER": "mock",
     "RTC_ENDPOINT": "https://realtime.cloudflare.com",
     "CLOUDFLARE_API_BASE_URL": "https://api.cloudflare.com/client/v4",
     "CLOUDFLARE_SUBSCRIBER_PRESET": "group_call_participant",
@@ -33,7 +33,7 @@
     "RUNPOD_DATA_CENTER_IDS": "",
     "RUNPOD_COUNTRY_CODES": "",
     "RUNPOD_NAME_PREFIX": "coherent-worker",
-    "SESSION_PROVISION_TIMEOUT_MS": "30000",
+    "SESSION_PROVISION_TIMEOUT_MS": "180000",
     "SESSION_PROVISION_POLL_MS": "2000"
   }
 }

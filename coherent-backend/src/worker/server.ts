@@ -28,6 +28,14 @@ const messageSchema = z.discriminatedUnion('type', [
     format: z.enum(['f32le', 's16le']).optional(),
   }),
   z.object({
+    type: z.literal('audio.append.binary'),
+    sequence: z.number().int().nonnegative(),
+    sampleRate: z.number().int().positive(),
+    channels: z.number().int().positive(),
+    format: z.enum(['f32le', 's16le']).optional(),
+    byteLength: z.number().int().nonnegative(),
+  }),
+  z.object({
     type: z.literal('audio.end'),
   }),
   z.object({
@@ -37,6 +45,23 @@ const messageSchema = z.discriminatedUnion('type', [
     type: z.literal('heartbeat'),
   }),
 ]);
+
+function normalizeBase64(value: string): string {
+  const normalized = value.trim().replace(/-/g, '+').replace(/_/g, '/');
+  const padding = (-normalized.length) % 4;
+  return padding > 0 ? normalized + '='.repeat(padding) : normalized;
+}
+
+function decodeBase64Strict(value: string): { bytes: Buffer; normalized: string; canonical: string } {
+  const normalized = normalizeBase64(value);
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalized)) {
+    throw new Error('Audio chunk contained invalid base64 characters.');
+  }
+
+  const bytes = Buffer.from(normalized, 'base64');
+  const canonical = bytes.toString('base64');
+  return { bytes, normalized, canonical };
+}
 
 function send(socket: { send: (payload: string) => void }, message: WorkerToClientMessage) {
   socket.send(JSON.stringify(message));
@@ -108,8 +133,44 @@ export async function buildWorkerServer() {
       return reply.code(404).send({ error: 'media_not_found' });
     }
 
+    const fileStat = fs.statSync(filePath);
+    const fileSize = fileStat.size;
+    const rangeHeader = typeof request.headers.range === 'string' ? request.headers.range : '';
+
+    reply.header('accept-ranges', 'bytes');
     reply.type('video/mp4');
-    return reply.send(fs.createReadStream(filePath));
+
+    if (!rangeHeader.startsWith('bytes=')) {
+      reply.header('content-length', String(fileSize));
+      return reply.send(fs.createReadStream(filePath));
+    }
+
+    const [rawStart, rawEnd] = rangeHeader.replace('bytes=', '').split('-', 2);
+    const parsedStart = rawStart ? Number.parseInt(rawStart, 10) : Number.NaN;
+    const parsedEnd = rawEnd ? Number.parseInt(rawEnd, 10) : Number.NaN;
+
+    let start = Number.isFinite(parsedStart) ? parsedStart : 0;
+    let end = Number.isFinite(parsedEnd) ? parsedEnd : fileSize - 1;
+
+    if (!rawStart && Number.isFinite(parsedEnd)) {
+      const suffixLength = parsedEnd;
+      start = Math.max(fileSize - suffixLength, 0);
+      end = fileSize - 1;
+    }
+
+    if (start < 0 || end < start || start >= fileSize) {
+      reply.code(416);
+      reply.header('content-range', `bytes */${fileSize}`);
+      return reply.send();
+    }
+
+    end = Math.min(end, fileSize - 1);
+    const chunkSize = end - start + 1;
+
+    reply.code(206);
+    reply.header('content-length', String(chunkSize));
+    reply.header('content-range', `bytes ${start}-${end}/${fileSize}`);
+    return reply.send(fs.createReadStream(filePath, { start, end }));
   });
 
   app.get('/ws', { websocket: true }, (socket, request) => {
@@ -151,8 +212,64 @@ export async function buildWorkerServer() {
 
     runtime.on('segment', handleSegment);
 
-    socket.on('message', async (raw: Buffer) => {
+    let pendingBinaryAudio:
+      | {
+          sequence: number;
+          sampleRate: number;
+          channels: number;
+          format: 'f32le' | 's16le';
+          byteLength: number;
+        }
+      | null = null;
+
+    socket.on('message', async (raw: Buffer, isBinary: boolean) => {
       try {
+        if (isBinary) {
+          if (!sessionPayload) {
+            send(socket, {
+              type: 'error',
+              code: 'session_not_started',
+              message: 'Send session.start before any audio messages.',
+            });
+            return;
+          }
+
+          if (!pendingBinaryAudio) {
+            send(socket, {
+              type: 'session.error',
+              sessionId: sessionPayload.sessionId,
+              code: 'unexpected_binary_audio',
+              message: 'Received binary audio without preceding metadata.',
+              recoverable: false,
+            });
+            return;
+          }
+
+          const metadata = pendingBinaryAudio;
+          pendingBinaryAudio = null;
+          const bytes = Buffer.from(raw);
+          if (metadata.byteLength > 0 && bytes.length !== metadata.byteLength) {
+            console.warn(
+              `[worker:${sessionPayload.sessionId}] audio binary length mismatch sequence=${metadata.sequence} expected=${metadata.byteLength} actual=${bytes.length}`,
+            );
+          }
+          const metrics = await runtime.appendAudio(sessionPayload.sessionId, bytes, {
+            sequence: metadata.sequence,
+            sampleRate: metadata.sampleRate,
+            channels: metadata.channels,
+            format: metadata.format,
+          });
+          await controlPlaneClient.touchSession(sessionPayload.sessionId, 'streaming');
+          send(socket, {
+            type: 'audio.ack',
+            sessionId: sessionPayload.sessionId,
+            sequence: metadata.sequence,
+            totalAudioBytes: metrics.totalAudioBytes,
+            estimatedFrames: metrics.estimatedFrames,
+          });
+          return;
+        }
+
         const parsed = messageSchema.parse(
           JSON.parse(raw.toString()),
         ) as ClientToWorkerMessage;
@@ -212,8 +329,10 @@ export async function buildWorkerServer() {
         }
 
         if (parsed.type === 'audio.append') {
-          const bytes = Buffer.from(parsed.pcmBase64, 'base64');
-          const metrics = await runtime.appendAudio(sessionPayload.sessionId, bytes, {
+          const decoded = decodeBase64Strict(parsed.pcmBase64);
+          const metrics = await runtime.appendAudio(sessionPayload.sessionId, decoded.bytes, {
+            sequence: parsed.sequence,
+            pcmBase64: decoded.canonical,
             sampleRate: parsed.sampleRate,
             channels: parsed.channels,
             format: parsed.format ?? 'f32le',
@@ -226,6 +345,17 @@ export async function buildWorkerServer() {
             totalAudioBytes: metrics.totalAudioBytes,
             estimatedFrames: metrics.estimatedFrames,
           });
+          return;
+        }
+
+        if (parsed.type === 'audio.append.binary') {
+          pendingBinaryAudio = {
+            sequence: parsed.sequence,
+            sampleRate: parsed.sampleRate,
+            channels: parsed.channels,
+            format: parsed.format ?? 's16le',
+            byteLength: parsed.byteLength,
+          };
           return;
         }
 
@@ -296,10 +426,18 @@ export async function buildWorkerServer() {
   let heartbeatTimer: NodeJS.Timeout | null = null;
   let registerRetryTimer: NodeJS.Timeout | null = null;
   let registeredWithControlPlane = false;
+  let prewarmStarted = false;
 
-  app.addHook('onReady', async () => {
-    await runtime.prewarmCommonBridges();
-  });
+  const startBridgePrewarm = () => {
+    if (prewarmStarted) {
+      return;
+    }
+    prewarmStarted = true;
+
+    void runtime.prewarmCommonBridges().catch((error) => {
+      app.log.warn(error, 'SoulX bridge prewarm failed; sessions will fall back to on-demand bridge startup.');
+    });
+  };
 
   app.addHook('onListen', async () => {
     const registerWorker = async () => {
@@ -323,6 +461,7 @@ export async function buildWorkerServer() {
     };
 
     await registerWorker();
+    startBridgePrewarm();
 
     heartbeatTimer = setInterval(() => {
       if (!registeredWithControlPlane) {
