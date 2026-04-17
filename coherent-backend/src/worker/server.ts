@@ -248,6 +248,9 @@ export async function buildWorkerServer() {
           const metadata = pendingBinaryAudio;
           pendingBinaryAudio = null;
           const bytes = Buffer.from(raw);
+          console.log(
+            `[worker:${sessionPayload.sessionId}] received audio binary sequence=${metadata.sequence} format=${metadata.format} expectedBytes=${metadata.byteLength} actualBytes=${bytes.length}`,
+          );
           if (metadata.byteLength > 0 && bytes.length !== metadata.byteLength) {
             console.warn(
               `[worker:${sessionPayload.sessionId}] audio binary length mismatch sequence=${metadata.sequence} expected=${metadata.byteLength} actual=${bytes.length}`,
@@ -349,6 +352,9 @@ export async function buildWorkerServer() {
         }
 
         if (parsed.type === 'audio.append.binary') {
+          console.log(
+            `[worker:${sessionPayload.sessionId}] received audio metadata sequence=${parsed.sequence} format=${parsed.format ?? 's16le'} byteLength=${parsed.byteLength} sampleRate=${parsed.sampleRate} channels=${parsed.channels}`,
+          );
           pendingBinaryAudio = {
             sequence: parsed.sequence,
             sampleRate: parsed.sampleRate,
@@ -360,6 +366,9 @@ export async function buildWorkerServer() {
         }
 
         if (parsed.type === 'audio.end') {
+          console.log(
+            `[worker:${sessionPayload.sessionId}] received audio.end pendingBinary=${pendingBinaryAudio ? pendingBinaryAudio.sequence : 'none'}`,
+          );
           await runtime.signalAudioEnd(sessionPayload.sessionId);
           await controlPlaneClient.touchSession(sessionPayload.sessionId, 'streaming');
           send(socket, {

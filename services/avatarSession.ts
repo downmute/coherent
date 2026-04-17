@@ -335,17 +335,25 @@ export class AvatarSessionClient {
                     byteLength: s16leBytes.byteLength,
                 }),
             );
+            console.log(
+                `[Avatar Session] send audio metadata sequence=${sequence} byteLength=${s16leBytes.byteLength} samples=${chunk.length} sampleRate=${sampleRate} channels=${channels}`,
+            );
             const buffer = s16leBytes.buffer.slice(
                 s16leBytes.byteOffset,
                 s16leBytes.byteOffset + s16leBytes.byteLength,
             );
             this.socket.send(buffer);
+            console.log(
+                `[Avatar Session] send audio binary sequence=${sequence} byteLength=${s16leBytes.byteLength}`,
+            );
             await ackPromise;
+            console.log(`[Avatar Session] audio ack received sequence=${sequence}`);
         }
     }
 
     signalAudioEnd(): void {
         if (this.socket?.readyState === WebSocket.OPEN) {
+            console.log('[Avatar Session] send audio.end');
             this.socket.send(JSON.stringify({ type: 'audio.end' }));
         }
     }

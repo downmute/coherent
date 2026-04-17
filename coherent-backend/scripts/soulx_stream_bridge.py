@@ -46,6 +46,54 @@ def emit(payload):
     sys.stdout.flush()
 
 
+def log_debug(message):
+    print(message, file=sys.stderr, flush=True)
+
+
+def read_exact(buffer, byte_length):
+    if byte_length <= 0:
+        return b""
+
+    chunks = bytearray()
+    remaining = byte_length
+    while remaining > 0:
+        chunk = buffer.read(remaining)
+        if not chunk:
+            break
+        chunks.extend(chunk)
+        remaining -= len(chunk)
+    return bytes(chunks)
+
+
+def read_framed_message(buffer):
+    header_length_bytes = read_exact(buffer, 4)
+    if len(header_length_bytes) == 0:
+        return None
+    if len(header_length_bytes) != 4:
+        raise ValueError(f"Incomplete frame header length prefix: got {len(header_length_bytes)} byte(s)")
+
+    binary_length_bytes = read_exact(buffer, 4)
+    if len(binary_length_bytes) != 4:
+        raise ValueError(f"Incomplete frame binary length prefix: got {len(binary_length_bytes)} byte(s)")
+
+    header_length = int.from_bytes(header_length_bytes, byteorder="big", signed=False)
+    binary_length = int.from_bytes(binary_length_bytes, byteorder="big", signed=False)
+
+    header_bytes = read_exact(buffer, header_length)
+    if len(header_bytes) != header_length:
+        raise ValueError(
+            f"Incomplete frame header: expected {header_length} byte(s) and received {len(header_bytes)}"
+        )
+
+    binary_bytes = read_exact(buffer, binary_length)
+    if len(binary_bytes) != binary_length:
+        raise ValueError(
+            f"Incomplete frame payload: expected {binary_length} byte(s) and received {len(binary_bytes)}"
+        )
+
+    return header_bytes, binary_bytes
+
+
 def decode_pcm(base64_chunk, sample_rate, channels, pcm_format, target_sample_rate):
     normalized = str(base64_chunk).strip()
     normalized = normalized.replace("-", "+").replace("_", "/")
@@ -54,6 +102,27 @@ def decode_pcm(base64_chunk, sample_rate, channels, pcm_format, target_sample_ra
         normalized += "=" * padding
 
     raw = base64.b64decode(normalized)
+    if pcm_format == "f32le":
+      remainder = len(raw) % 4
+      if remainder:
+          raw = raw[: len(raw) - remainder]
+      audio = np.frombuffer(raw, dtype="<f4")
+    else:
+      remainder = len(raw) % 2
+      if remainder:
+          raw = raw[: len(raw) - remainder]
+      audio = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+
+    if sample_rate != target_sample_rate:
+        audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=target_sample_rate)
+
+    return audio.astype(np.float32)
+
+
+def decode_pcm_bytes(raw, sample_rate, channels, pcm_format, target_sample_rate):
     if pcm_format == "f32le":
       remainder = len(raw) % 4
       if remainder:
@@ -143,6 +212,10 @@ def flush_segment(
     is_final,
 ):
     if not segment_frames or not segment_audio:
+        log_debug(
+            f"[bridge] flush_segment skipped index={segment_index} final={is_final} "
+            f"frames={len(segment_frames)} audio={len(segment_audio)}"
+        )
         return segment_index
 
     combined_frames = np.concatenate(segment_frames, axis=0)
@@ -151,6 +224,11 @@ def flush_segment(
     raw_video_path = output_dir / f"{segment_stem}_video.mp4"
     audio_path = output_dir / f"{segment_stem}.wav"
     output_path = output_dir / f"{segment_stem}.mp4"
+
+    log_debug(
+        f"[bridge] flush_segment start index={segment_index} final={is_final} "
+        f"frameCount={combined_frames.shape[0]} audioSamples={combined_audio.shape[0]}"
+    )
 
     try:
         write_video(combined_frames, tgt_fps, raw_video_path)
@@ -192,6 +270,9 @@ def flush_segment(
         "durationSeconds": float(combined_audio.shape[0] / sample_rate),
         "frames": int(combined_frames.shape[0]),
     })
+    log_debug(
+        f"[bridge] flush_segment done index={segment_index} final={is_final} output={output_path.name}"
+    )
     return segment_index + 1
 
 
@@ -242,11 +323,44 @@ def main():
 
     emit({"type": "ready"})
 
-    for line in sys.stdin:
+    stdin_buffer = sys.stdin.buffer
+
+    while True:
+        try:
+            frame = read_framed_message(stdin_buffer)
+        except Exception as error:
+            emit({
+                "type": "error",
+                "message": f"Invalid framed message sent to SoulX bridge: {error}",
+            })
+            break
+
+        if frame is None:
+            break
+
+        header_bytes, binary_bytes = frame
+        line = header_bytes.decode("utf-8", errors="replace")
         try:
             message = json.loads(line)
         except json.JSONDecodeError:
-            emit({"type": "error", "message": "Invalid JSON sent to SoulX bridge."})
+            preview = line[:180]
+            emit({
+                "type": "error",
+                "message": (
+                    f"Invalid JSON sent to SoulX bridge. "
+                    f"lineLen={len(line)} binaryLen={len(binary_bytes)} preview={preview!r}"
+                ),
+            })
+            continue
+
+        if not isinstance(message, dict):
+            emit({
+                "type": "error",
+                "message": (
+                    f"Invalid message type sent to SoulX bridge. "
+                    f"jsonType={type(message).__name__} lineLen={len(line)} binaryLen={len(binary_bytes)}"
+                ),
+            })
             continue
 
         if message.get("type") == "close":
@@ -265,14 +379,22 @@ def main():
             continue
 
         if message.get("type") == "audio_end":
+            log_debug(
+                f"[bridge] audio_end received pendingSamples={stream_state['pending_audio'].shape[0]} "
+                f"chunksInSegment={stream_state['chunks_in_segment']} segmentIndex={stream_state['segment_index']}"
+            )
             pending_audio = stream_state["pending_audio"]
             if pending_audio.shape[0] > 0:
+                log_debug(
+                    f"[bridge] audio_end padding tail from {pending_audio.shape[0]} to {human_speech_array_slice_len} samples"
+                )
                 padded_audio = np.pad(
                     pending_audio,
                     (0, human_speech_array_slice_len - pending_audio.shape[0]),
                     mode="constant",
                 ).astype(np.float32)
                 stream_state["pending_audio"] = np.zeros((0,), dtype=np.float32)
+                log_debug("[bridge] audio_end running tail inference")
                 frames = run_inference(
                     pipeline,
                     stream_state["audio_dq"],
@@ -282,11 +404,18 @@ def main():
                     audio_end_idx,
                     motion_frames_num,
                 )
+                log_debug(
+                    f"[bridge] audio_end tail inference complete frames={0 if frames is None else int(frames.shape[0])}"
+                )
                 if frames is not None and frames.shape[0] > 0:
                     stream_state["segment_frames"].append(frames)
                     stream_state["segment_audio"].append(padded_audio)
                     stream_state["chunks_in_segment"] += 1
             if stream_state["chunks_in_segment"] > 0:
+                log_debug(
+                    f"[bridge] audio_end flushing final segment index={stream_state['segment_index']} "
+                    f"chunks={stream_state['chunks_in_segment']}"
+                )
                 stream_state["segment_index"] = flush_segment(
                     stream_state["segment_index"],
                     stream_state["segment_frames"],
@@ -299,31 +428,60 @@ def main():
                 stream_state["segment_frames"] = []
                 stream_state["segment_audio"] = []
                 stream_state["chunks_in_segment"] = 0
+            else:
+                log_debug("[bridge] audio_end had no segment frames to flush")
             emit({"type": "audio_end_ack"})
+            log_debug("[bridge] audio_end ack emitted")
             continue
 
-        if message.get("type") != "audio_chunk":
-            continue
-
-        try:
-            chunk = decode_pcm(
-                message["pcmBase64"],
-                int(message["sampleRate"]),
-                int(message["channels"]),
-                message["format"],
-                sample_rate,
-            )
-        except Exception as error:
-            raw_pcm = str(message.get("pcmBase64", ""))
-            normalized = raw_pcm.strip().replace("-", "+").replace("_", "/")
-            emit({
-                "type": "error",
-                "message": (
-                    f"Failed to decode PCM chunk seq={message.get('sequence')} "
-                    f"rawLen={len(raw_pcm)} normalizedLen={len(normalized)} "
-                    f"mod4={len(normalized) % 4}: {error}"
-                ),
-            })
+        if message.get("type") == "audio_chunk_binary":
+            try:
+                byte_length = int(message["byteLength"])
+                if byte_length < 0:
+                    raise ValueError("byteLength must be non-negative")
+                raw_chunk = binary_bytes
+                if len(raw_chunk) != byte_length:
+                    raise ValueError(
+                        f"Expected {byte_length} bytes of PCM data but received {len(raw_chunk)}"
+                    )
+                chunk = decode_pcm_bytes(
+                    raw_chunk,
+                    int(message["sampleRate"]),
+                    int(message["channels"]),
+                    message["format"],
+                    sample_rate,
+                )
+            except Exception as error:
+                emit({
+                    "type": "error",
+                    "message": (
+                        f"Failed to decode binary PCM chunk seq={message.get('sequence')} "
+                        f"byteLength={message.get('byteLength')}: {error}"
+                    ),
+                })
+                continue
+        elif message.get("type") == "audio_chunk":
+            try:
+                chunk = decode_pcm(
+                    message["pcmBase64"],
+                    int(message["sampleRate"]),
+                    int(message["channels"]),
+                    message["format"],
+                    sample_rate,
+                )
+            except Exception as error:
+                raw_pcm = str(message.get("pcmBase64", ""))
+                normalized = raw_pcm.strip().replace("-", "+").replace("_", "/")
+                emit({
+                    "type": "error",
+                    "message": (
+                        f"Failed to decode PCM chunk seq={message.get('sequence')} "
+                        f"rawLen={len(raw_pcm)} normalizedLen={len(normalized)} "
+                        f"mod4={len(normalized) % 4}: {error}"
+                    ),
+                })
+                continue
+        else:
             continue
 
         stream_state["pending_audio"] = np.concatenate([stream_state["pending_audio"], chunk])

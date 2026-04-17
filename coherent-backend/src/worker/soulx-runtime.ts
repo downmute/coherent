@@ -35,6 +35,9 @@ interface BridgeHandle {
   alive: boolean;
   failure: string | null;
   currentSessionId: string | null;
+  commandChain: Promise<void>;
+  commandSerial: number;
+  pendingCommandCount: number;
 }
 
 interface RuntimeSession {
@@ -251,6 +254,9 @@ export class SoulxRuntime extends EventEmitter {
       alive: true,
       failure: null,
       currentSessionId: null,
+      commandChain: Promise.resolve(),
+      commandSerial: 0,
+      pendingCommandCount: 0,
     };
 
     handle.ready = new Promise<void>((resolve, reject) => {
@@ -319,32 +325,116 @@ export class SoulxRuntime extends EventEmitter {
     return handle;
   }
 
+  private summarizeBridgePayload(payload: string | Buffer): string {
+    const text = typeof payload === 'string' ? payload : payload.toString('utf8');
+    const line = text.endsWith('\n') ? text.slice(0, -1) : text;
+    if (line.length <= 180) {
+      return line;
+    }
+    return `${line.slice(0, 180)}...`;
+  }
+
+  private summarizeBinaryBytes(bytes: Buffer): string {
+    const previewLength = Math.min(bytes.length, 16);
+    const preview = bytes.subarray(0, previewLength).toString('hex');
+    return `binary:${bytes.length}B preview=${preview}${bytes.length > previewLength ? '...' : ''}`;
+  }
+
+  private combineCommandSummary(header: string, binaryPayload?: Buffer): string {
+    if (!binaryPayload) {
+      return this.summarizeBridgePayload(header);
+    }
+    return `${this.summarizeBridgePayload(header)} ${this.summarizeBinaryBytes(binaryPayload)}`;
+  }
+
+  private createBridgeCommandPayload(header: string, binaryPayload?: Buffer): Buffer {
+    const headerBuffer = Buffer.from(header, 'utf8');
+    const binaryLength = binaryPayload?.length ?? 0;
+    const prefix = Buffer.alloc(8);
+    prefix.writeUInt32BE(headerBuffer.length, 0);
+    prefix.writeUInt32BE(binaryLength, 4);
+
+    if (!binaryPayload || binaryLength === 0) {
+      return Buffer.concat([prefix, headerBuffer]);
+    }
+    return Buffer.concat([prefix, headerBuffer, binaryPayload]);
+  }
+
+  private getBridgeTarget(handle: BridgeHandle): string {
+    return handle.currentSessionId ?? handle.id;
+  }
+
+  private async enqueueBridgeCommand(
+    handle: BridgeHandle,
+    label: string,
+    payload: string | Buffer,
+    summaryOverride?: string,
+  ): Promise<void> {
+    const target = this.getBridgeTarget(handle);
+    const commandId = ++handle.commandSerial;
+    handle.pendingCommandCount += 1;
+    const payloadBytes = typeof payload === 'string' ? Buffer.byteLength(payload) : payload.length;
+    const summary = summaryOverride ?? this.summarizeBridgePayload(payload);
+    console.log(
+      `[soulx-bridge:${target}] queue command #${commandId} ${label} bytes=${payloadBytes} pending=${handle.pendingCommandCount} summary=${summary}`,
+    );
+
+    const run = async () => {
+      const activeTarget = this.getBridgeTarget(handle);
+      if (!handle.alive || handle.process.stdin.destroyed || !handle.process.stdin.writable) {
+        throw new Error(handle.failure || 'SoulX bridge is no longer available.');
+      }
+
+      console.log(
+        `[soulx-bridge:${activeTarget}] write start #${commandId} ${label} bytes=${payloadBytes}`,
+      );
+      await new Promise<void>((resolve, reject) => {
+        handle.process.stdin.write(payload, (error) => {
+          if (error) {
+            handle.alive = false;
+            handle.failure = error.message;
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
+      console.log(`[soulx-bridge:${activeTarget}] write done #${commandId} ${label}`);
+    };
+
+    const next = handle.commandChain.then(run);
+    handle.commandChain = next.catch(() => {});
+
+    try {
+      await next;
+    } catch (error) {
+      const activeTarget = this.getBridgeTarget(handle);
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[soulx-bridge:${activeTarget}] write failed #${commandId} ${label}: ${message}`);
+      throw error;
+    } finally {
+      handle.pendingCommandCount = Math.max(0, handle.pendingCommandCount - 1);
+      const activeTarget = this.getBridgeTarget(handle);
+      console.log(
+        `[soulx-bridge:${activeTarget}] queue settled #${commandId} ${label} pending=${handle.pendingCommandCount}`,
+      );
+    }
+  }
+
   private async resetBridge(handle: BridgeHandle, mediaDir: string): Promise<void> {
     handle.mediaDir = mediaDir;
-    if (!handle.alive || handle.process.stdin.destroyed || !handle.process.stdin.writable) {
-      throw new Error(handle.failure || 'SoulX bridge is no longer available.');
-    }
     handle.resetPromise = new Promise<void>((resolve, reject) => {
       handle.resetResolve = resolve;
       handle.resetReject = reject;
     });
 
-    const payload = `${JSON.stringify({
+    const header = JSON.stringify({
       type: 'reset',
       outputDir: mediaDir,
       chunksPerSegment: this.config.SOULX_CHUNKS_PER_SEGMENT,
-    })}\n`;
-    await new Promise<void>((resolve, reject) => {
-      handle.process.stdin.write(payload, (error) => {
-        if (error) {
-          handle.alive = false;
-          handle.failure = error.message;
-          reject(error);
-          return;
-        }
-        resolve();
-      });
     });
+    const payload = this.createBridgeCommandPayload(header);
+    await this.enqueueBridgeCommand(handle, 'reset', payload, this.summarizeBridgePayload(header));
     await handle.resetPromise;
   }
 
@@ -415,7 +505,9 @@ export class SoulxRuntime extends EventEmitter {
     handle.currentSessionId = null;
     try {
       if (!handle.process.stdin.destroyed && handle.process.stdin.writable) {
-        handle.process.stdin.write(`${JSON.stringify({ type: 'close' })}\n`);
+        const header = JSON.stringify({ type: 'close' });
+        const payload = this.createBridgeCommandPayload(header);
+        await this.enqueueBridgeCommand(handle, 'close', payload, this.summarizeBridgePayload(header));
       }
     } catch {}
     try {
@@ -504,6 +596,7 @@ export class SoulxRuntime extends EventEmitter {
     }
 
     if (payload.type === 'reset_ack') {
+      console.log(`[soulx-bridge:${handle.currentSessionId ?? handle.id}] reset acknowledged`);
       handle.resetResolve?.();
       handle.resetPromise = null;
       handle.resetResolve = undefined;
@@ -570,6 +663,7 @@ export class SoulxRuntime extends EventEmitter {
     }
 
     if (payload.type === 'audio_end_ack') {
+      console.log(`[soulx-bridge:${sessionId}] audio_end acknowledged`);
       handle.audioEndResolve?.();
       handle.audioEndPromise = null;
       handle.audioEndResolve = undefined;
@@ -703,27 +797,31 @@ export class SoulxRuntime extends EventEmitter {
         throw new Error(session.bridge.failure || 'SoulX bridge is no longer available.');
       }
 
-      const payload = `${JSON.stringify({
-        type: 'audio_chunk',
+      const header = JSON.stringify({
+        type: 'audio_chunk_binary',
         sequence: options.sequence ?? null,
-        pcmBase64: options.pcmBase64 ?? chunk.toString('base64'),
         sampleRate: options.sampleRate,
         channels: options.channels,
         format: options.format,
-      })}\n`;
-
-      await new Promise<void>((resolve, reject) => {
-        session.bridge!.process.stdin.write(payload, (error) => {
-          if (error) {
-            session.bridge!.alive = false;
-            session.bridge!.failure = error.message;
-            this.markSessionFailed(session, error.message);
-            reject(error);
-            return;
-          }
-          resolve();
-        });
+        byteLength: chunk.length,
       });
+      const payload = this.createBridgeCommandPayload(header, chunk);
+      console.log(
+        `[soulx-runtime:${sessionId}] appendAudio seq=${String(options.sequence ?? 'null')} format=${options.format} chunkBytes=${chunk.length} bridgePending=${session.bridge.pendingCommandCount}`,
+      );
+      try {
+        await this.enqueueBridgeCommand(
+          session.bridge,
+          `audio_chunk seq=${String(options.sequence ?? 'null')}`,
+          payload,
+          this.combineCommandSummary(header, chunk),
+        );
+      } catch (error) {
+        session.bridge.alive = false;
+        session.bridge.failure = error instanceof Error ? error.message : String(error);
+        this.markSessionFailed(session, session.bridge.failure);
+        throw error;
+      }
       return session.publisher.getMetrics();
     }
 
@@ -763,19 +861,24 @@ export class SoulxRuntime extends EventEmitter {
         session.bridge!.audioEndReject = reject;
       });
 
-      const payload = `${JSON.stringify({ type: 'audio_end' })}\n`;
-      await new Promise<void>((resolve, reject) => {
-        session.bridge!.process.stdin.write(payload, (error) => {
-          if (error) {
-            session.bridge!.alive = false;
-            session.bridge!.failure = error.message;
-            this.markSessionFailed(session, error.message);
-            reject(error);
-            return;
-          }
-          resolve();
-        });
-      });
+      const header = JSON.stringify({ type: 'audio_end' });
+      const payload = this.createBridgeCommandPayload(header);
+      console.log(
+        `[soulx-runtime:${sessionId}] signalAudioEnd bridgePending=${session.bridge.pendingCommandCount}`,
+      );
+      try {
+        await this.enqueueBridgeCommand(
+          session.bridge,
+          'audio_end',
+          payload,
+          this.summarizeBridgePayload(header),
+        );
+      } catch (error) {
+        session.bridge.alive = false;
+        session.bridge.failure = error instanceof Error ? error.message : String(error);
+        this.markSessionFailed(session, session.bridge.failure);
+        throw error;
+      }
     }
 
     await session.bridge.audioEndPromise;
