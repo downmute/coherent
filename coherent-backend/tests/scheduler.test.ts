@@ -121,6 +121,8 @@ const config: ControlPlaneConfig = {
   AUTO_MIGRATE: false,
   WORKER_TOKEN_SECRET: 'test-worker-secret',
   RTC_TOKEN_SECRET: 'test-rtc-secret',
+  INTERNAL_API_KEY: '',
+  GROQ_API_KEY: '',
   RTC_PROVIDER: 'mock',
   RTC_ENDPOINT: 'https://rtc.example.com',
   CLOUDFLARE_API_BASE_URL: 'https://api.cloudflare.com/client/v4',

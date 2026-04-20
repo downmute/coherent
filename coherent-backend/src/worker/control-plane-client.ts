@@ -8,10 +8,18 @@ export class ControlPlaneClient {
     return `${this.config.CONTROL_PLANE_URL.replace(/\/$/, '')}${path}`;
   }
 
+  private internalHeaders(): Record<string, string> {
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    if (this.config.INTERNAL_API_KEY) {
+      headers['x-internal-api-key'] = this.config.INTERNAL_API_KEY;
+    }
+    return headers;
+  }
+
   async registerWorker(input: RegisterWorkerRequest): Promise<void> {
     const response = await fetch(this.buildUrl('/internal/workers/register'), {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: this.internalHeaders(),
       body: JSON.stringify(input),
     });
     if (!response.ok) {
@@ -26,7 +34,7 @@ export class ControlPlaneClient {
   }): Promise<void> {
     const response = await fetch(this.buildUrl('/internal/workers/heartbeat'), {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: this.internalHeaders(),
       body: JSON.stringify({
         workerKey: this.config.WORKER_KEY,
         status: input.status,
@@ -42,7 +50,7 @@ export class ControlPlaneClient {
   async touchSession(sessionId: string, status?: SessionStatus): Promise<void> {
     const response = await fetch(this.buildUrl(`/internal/sessions/${sessionId}/activity`), {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: this.internalHeaders(),
       body: JSON.stringify({ status }),
     });
     if (!response.ok) {

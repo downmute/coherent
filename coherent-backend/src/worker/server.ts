@@ -212,6 +212,21 @@ export async function buildWorkerServer() {
 
     runtime.on('segment', handleSegment);
 
+    const handleSessionError = (event: { sessionId: string; code: string; message: string }) => {
+      if (!sessionPayload || event.sessionId !== sessionPayload.sessionId) {
+        return;
+      }
+      send(socket, {
+        type: 'session.error',
+        sessionId: event.sessionId,
+        code: event.code,
+        message: event.message,
+        recoverable: false,
+      });
+    };
+
+    runtime.on('session.error', handleSessionError);
+
     let pendingBinaryAudio:
       | {
           sequence: number;
@@ -419,6 +434,7 @@ export async function buildWorkerServer() {
 
     socket.on('close', () => {
       runtime.off('segment', handleSegment);
+      runtime.off('session.error', handleSessionError);
       if (!sessionPayload) {
         return;
       }

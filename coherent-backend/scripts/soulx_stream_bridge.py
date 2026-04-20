@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument("--base_seed", type=int, default=9999)
     parser.add_argument("--use_face_crop", type=str, default="false")
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--chunks_per_segment", type=int, default=3)
+    parser.add_argument("--chunks_per_segment", type=int, default=1)
     return parser.parse_args()
 
 
@@ -157,7 +157,6 @@ def run_inference(
 
     try:
         audio_embedding = get_audio_embedding(pipeline, audio_array, audio_start_idx, audio_end_idx)
-        torch.cuda.synchronize()
         video = run_pipeline(pipeline, audio_embedding)
         video = video[motion_frames_num:]
         torch.cuda.synchronize()

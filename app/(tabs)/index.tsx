@@ -11,7 +11,7 @@ export default function HomeScreen() {
                     Master your social skills with real-time feedback.
                 </Text>
 
-                <Link href="/(tabs)/chat" asChild>
+                <Link href="/(tabs)/voice" asChild>
                     <TouchableOpacity className="bg-blue-600 px-8 py-4 rounded-full active:bg-blue-700">
                         <Text className="text-white font-bold text-lg">Start Practicing</Text>
                     </TouchableOpacity>

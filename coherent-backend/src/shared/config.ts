@@ -1,8 +1,20 @@
 import { z } from 'zod';
 
+const INSECURE_DEFAULTS = new Set(['change-me', 'change-me-too', 'secret', 'password', '']);
+
+function assertNotDefault(name: string, value: string): void {
+  if (INSECURE_DEFAULTS.has(value)) {
+    throw new Error(
+      `[config] ${name} is set to an insecure default value "${value}". ` +
+      'Generate a cryptographically random secret (e.g. openssl rand -hex 32) and set it in your .env file.',
+    );
+  }
+}
+
 const commonSchema = z.object({
   WORKER_TOKEN_SECRET: z.string().min(1).default('change-me'),
   RTC_TOKEN_SECRET: z.string().min(1).default('change-me-too'),
+  INTERNAL_API_KEY: z.string().min(1).default(''),
   RTC_PROVIDER: z.enum(['mock', 'cloudflare']).default('mock'),
   RTC_ENDPOINT: z.string().url().default('https://rtc.example.com'),
   CLOUDFLARE_API_BASE_URL: z.string().url().default('https://api.cloudflare.com/client/v4'),
@@ -14,6 +26,7 @@ const commonSchema = z.object({
 });
 
 const controlPlaneSchema = commonSchema.extend({
+  GROQ_API_KEY: z.string().default(''),
   DATABASE_URL: z.string().min(1).default('postgres://postgres:postgres@localhost:5432/coherent_backend'),
   CONTROL_PLANE_PORT: z.coerce.number().int().positive().default(8080),
   CONTROL_PLANE_HOST: z.string().default('0.0.0.0'),
@@ -65,7 +78,7 @@ const workerSchema = commonSchema.extend({
   WORKER_RTC_FPS: z.coerce.number().int().positive().default(24),
   SOULX_RUNTIME_MODE: z.enum(['mock', 'python_bridge']).default('mock'),
   SOULX_DELIVERY_MODE: z.enum(['rtc_frames', 'segment_mp4']).default('segment_mp4'),
-  SOULX_CHUNKS_PER_SEGMENT: z.coerce.number().int().positive().default(3),
+  SOULX_CHUNKS_PER_SEGMENT: z.coerce.number().int().positive().default(1),
   SOULX_PREWARM_MAX_BRIDGES: z.coerce.number().int().min(0).default(2),
   SOULX_CKPT_DIR: z.string().default('/opt/SoulX-FlashHead/models/SoulX-FlashHead-1_3B'),
   SOULX_WAV2VEC_DIR: z.string().default('/opt/SoulX-FlashHead/models/wav2vec2-base-960h'),
@@ -85,9 +98,15 @@ export type ControlPlaneConfig = z.infer<typeof controlPlaneSchema>;
 export type WorkerConfig = z.infer<typeof workerSchema>;
 
 export function getControlPlaneConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneConfig {
-  return controlPlaneSchema.parse(env);
+  const config = controlPlaneSchema.parse(env);
+  assertNotDefault('WORKER_TOKEN_SECRET', config.WORKER_TOKEN_SECRET);
+  assertNotDefault('RTC_TOKEN_SECRET', config.RTC_TOKEN_SECRET);
+  return config;
 }
 
 export function getWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
-  return workerSchema.parse(env);
+  const config = workerSchema.parse(env);
+  assertNotDefault('WORKER_TOKEN_SECRET', config.WORKER_TOKEN_SECRET);
+  assertNotDefault('RTC_TOKEN_SECRET', config.RTC_TOKEN_SECRET);
+  return config;
 }

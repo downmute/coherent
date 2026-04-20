@@ -4,8 +4,11 @@ interface ChatMessage { role: 'system' | 'user' | 'assistant'; content: string; 
 interface ChatConfig { systemPrompt: string; initialMessageHistory: ChatMessage[]; contextWindowLength: number; }
 
 export function useGroqLLM() {
-    const apiKey = process.env.EXPO_PUBLIC_GROQ_API_KEY ?? '';
-    const isReady = Boolean(apiKey);
+    // Route through the backend proxy so the Groq API key never ships in the client bundle.
+    // Falls back to a direct Groq call only when a local dev key is explicitly set (never in prod).
+    const backendUrl = process.env.EXPO_PUBLIC_CONTROL_PLANE_URL?.trim() ?? '';
+    const devApiKey = __DEV__ ? (process.env.EXPO_PUBLIC_GROQ_API_KEY ?? '') : '';
+    const isReady = Boolean(backendUrl) || Boolean(devApiKey);
     const [isGenerating, setIsGenerating] = useState(false);
     const [messageHistory, setMessageHistory] = useState<ChatMessage[]>([]);
     const historyRef = useRef<ChatMessage[]>([]);
@@ -91,9 +94,15 @@ export function useGroqLLM() {
 
                 xhr.onerror = () => { xhrRef.current = null; reject(new Error('Network request failed')); };
 
-                xhr.open('POST', 'https://api.groq.com/openai/v1/chat/completions');
+                const useProxy = Boolean(backendUrl);
+                const url = useProxy
+                    ? `${backendUrl}/llm/chat`
+                    : 'https://api.groq.com/openai/v1/chat/completions';
+                xhr.open('POST', url);
                 xhr.setRequestHeader('Content-Type', 'application/json');
-                xhr.setRequestHeader('Authorization', `Bearer ${apiKey}`);
+                if (!useProxy && devApiKey) {
+                    xhr.setRequestHeader('Authorization', `Bearer ${devApiKey}`);
+                }
                 xhr.send(JSON.stringify({
                     model: 'llama-3.3-70b-versatile',
                     messages,
@@ -112,7 +121,7 @@ export function useGroqLLM() {
             historyRef.current = newHistory;
             setMessageHistory(newHistory);
         }
-    }, [apiKey]);
+    }, [backendUrl, devApiKey]);
 
     return {
         isReady,

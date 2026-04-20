@@ -318,6 +318,13 @@ export class SoulxRuntime extends EventEmitter {
           console.warn(
             `[soulx-bridge:${handle.currentSessionId}] exited code=${code ?? 'null'} signal=${signal ?? 'null'}`,
           );
+          // Emit a session.error event so the WebSocket client is notified immediately,
+          // rather than waiting for a heartbeat timeout to surface the failure.
+          this.emit('session.error', {
+            sessionId: handle.currentSessionId,
+            code: 'bridge_crashed',
+            message,
+          });
         }
       }
     });

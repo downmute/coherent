@@ -1080,11 +1080,17 @@ export function usePocketTTS(modelDir: string | null): PocketTTSHook {
             for (let step = 0; step < MAX_FRAMES; step++) {
                 if (abortRef.current) break;
 
+                // Yield every 3 steps so VAD callbacks, WS messages, and React state
+                // updates can process between backbone iterations on the JS thread.
+                if (step > 0 && step % 3 === 0) {
+                    await new Promise<void>(resolve => setTimeout(resolve, 0));
+                    if (abortRef.current) break;
+                }
+
                 // AR step: backbone advances by one frame
                 const { conditioning, eos } = await backbone.stepAR(currSeq);
                 const isEos = eos > EOS_THRESHOLD;
                 if (isEos && eosStep === null) eosStep = step;
-                console.log(`[PocketTTS] AR step ${step}: eos=${isEos} (${eos.toFixed(2)}) cond=${JSON.stringify(Array.from(conditioning.dims))}`);
 
                 if (abortRef.current) break;
 

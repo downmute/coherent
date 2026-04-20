@@ -308,7 +308,7 @@ export class AvatarSessionClient {
         return this.session.rtcCredentials;
     }
 
-    async appendFloat32Chunk(audio: Float32Array, sampleRate: number, channels: number = 1): Promise<void> {
+    appendFloat32Chunk(audio: Float32Array, sampleRate: number, channels: number = 1): void {
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN || !this.ready) {
             throw new Error('Avatar worker session is not ready.');
         }
@@ -322,9 +322,12 @@ export class AvatarSessionClient {
             this.sequence += 1;
             const s16leBytes = encodeFloat32ToS16leBytes(chunk);
             const sequence = this.sequence;
-            const ackPromise = new Promise<void>((resolve, reject) => {
+
+            // Register for telemetry; ACKs resolve asynchronously without blocking sends.
+            new Promise<void>((resolve, reject) => {
                 this.pendingAcks.set(sequence, { resolve, reject });
-            });
+            }).catch(() => {});
+
             this.socket.send(
                 JSON.stringify({
                     type: 'audio.append.binary',
@@ -335,19 +338,11 @@ export class AvatarSessionClient {
                     byteLength: s16leBytes.byteLength,
                 }),
             );
-            console.log(
-                `[Avatar Session] send audio metadata sequence=${sequence} byteLength=${s16leBytes.byteLength} samples=${chunk.length} sampleRate=${sampleRate} channels=${channels}`,
-            );
             const buffer = s16leBytes.buffer.slice(
                 s16leBytes.byteOffset,
                 s16leBytes.byteOffset + s16leBytes.byteLength,
             );
             this.socket.send(buffer);
-            console.log(
-                `[Avatar Session] send audio binary sequence=${sequence} byteLength=${s16leBytes.byteLength}`,
-            );
-            await ackPromise;
-            console.log(`[Avatar Session] audio ack received sequence=${sequence}`);
         }
     }
 

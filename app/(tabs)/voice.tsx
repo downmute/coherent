@@ -1392,26 +1392,25 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
                 streamedAudioPlayer.scheduleChunk(audioVec);
             };
 
-            const onNext = async (audioVec: Float32Array) => {
+            const onNext = (audioVec: Float32Array) => {
                 receivedChunkCount++;
                 const stableAudioVec = new Float32Array(audioVec);
-                let playedRemotely = false;
-                if (isVideoExperience && avatarSessionClientRef.current?.isReady()) {
-                    remoteChunkSendChain = remoteChunkSendChain.then(async () => {
-                        await avatarSessionClientRef.current?.appendFloat32Chunk(stableAudioVec, 24000, 1);
-                    });
-                    try {
-                        await remoteChunkSendChain;
-                        playedRemotely = true;
-                    } catch (error) {
-                        const message = error instanceof Error ? error.message : String(error);
-                        console.error('[Avatar Session] Failed to forward TTS chunk:', error);
-                        setVideoSessionError(message);
-                        await cleanupRemoteSession('tts forward failure');
-                    }
-                }
 
-                if (!playedRemotely) {
+                if (isVideoExperience && avatarSessionClientRef.current?.isReady()) {
+                    // Fire-and-forget: enqueue the send without blocking TTS generation.
+                    // appendFloat32Chunk is synchronous (socket.send); the chain just
+                    // serializes error handling across concurrent onNext calls.
+                    remoteChunkSendChain = remoteChunkSendChain
+                        .then(() => {
+                            avatarSessionClientRef.current?.appendFloat32Chunk(stableAudioVec, 24000, 1);
+                        })
+                        .catch((error) => {
+                            const message = error instanceof Error ? error.message : String(error);
+                            console.error('[Avatar Session] Failed to forward TTS chunk:', error);
+                            setVideoSessionError(message);
+                            void cleanupRemoteSession('tts forward failure');
+                        });
+                } else {
                     scheduleAudioVector(stableAudioVec);
                 }
                 maybeStartAmbientListener();
@@ -1463,19 +1462,16 @@ function VoiceChatScreen({ experience = 'voice' }: { experience?: PracticeExperi
                     }
                 }
                 if (fallbackAudio && fallbackAudio.length > 0) {
-                    let playedRemotely = false;
                     if (isVideoExperience && avatarSessionClientRef.current?.isReady()) {
                         try {
-                            await avatarSessionClientRef.current.appendFloat32Chunk(fallbackAudio, 24000, 1);
-                            playedRemotely = true;
+                            avatarSessionClientRef.current.appendFloat32Chunk(fallbackAudio, 24000, 1);
                         } catch (error) {
                             const message = error instanceof Error ? error.message : String(error);
                             console.error('[Avatar Session] Failed to forward fallback TTS chunk:', error);
                             setVideoSessionError(message);
-                            await cleanupRemoteSession('fallback tts forward failure');
+                            void cleanupRemoteSession('fallback tts forward failure');
                         }
-                    }
-                    if (!playedRemotely) {
+                    } else {
                         scheduleAudioVector(fallbackAudio);
                     }
                     maybeStartAmbientListener();

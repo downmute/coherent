@@ -16,9 +16,6 @@ export default function Index() {
 
     const checkOnboarding = async () => {
         try {
-            // RESET FOR DEBUGGING
-            await AsyncStorage.removeItem('has_onboarded');
-
             const value = await AsyncStorage.getItem('has_onboarded');
             setOnboarded(value === 'true');
         } catch (e) {

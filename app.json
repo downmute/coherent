@@ -15,9 +15,6 @@
         "ITSAppUsesNonExemptEncryption": false,
         "NSMicrophoneUsageDescription": "Allow Coherent to access your microphone to chat with the AI.",
         "NSAppTransportSecurity": {
-          "NSAllowsArbitraryLoads": true,
-          "NSAllowsArbitraryLoadsInWebContent": true,
-          "NSAllowsArbitraryLoadsForMedia": true,
           "NSAllowsLocalNetworking": true,
           "NSExceptionDomains": {
             "exp.direct": {

@@ -99,7 +99,8 @@ export async function buildControlPlaneServer() {
   const scheduler = new SchedulerService(store, rtc, provider, config);
 
   const app = Fastify({ logger: true });
-  await app.register(cors, { origin: true });
+  // Mobile-only API: disable cross-origin browser access entirely.
+  await app.register(cors, { origin: false });
 
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof ServiceError) {
@@ -119,10 +120,73 @@ export async function buildControlPlaneServer() {
     });
   });
 
+  // Protect all /internal/* routes with a shared API key.
+  app.addHook('preHandler', async (request, reply) => {
+    if (!request.url.startsWith('/internal/')) return;
+    if (!config.INTERNAL_API_KEY) return; // Key not configured — skip in dev.
+    const header = request.headers['x-internal-api-key'];
+    if (header !== config.INTERNAL_API_KEY) {
+      reply.status(401).send({ error: 'unauthorized', message: 'Invalid internal API key.' });
+    }
+  });
+
   app.get('/health', async () => ({
     ok: true,
     service: 'control-plane',
   }));
+
+  // LLM proxy — keeps the Groq API key server-side.
+  app.post('/llm/chat', async (request, reply) => {
+    if (!config.GROQ_API_KEY) {
+      reply.status(503).send({ error: 'llm_unavailable', message: 'LLM proxy is not configured on this server.' });
+      return;
+    }
+
+    const body = z.object({
+      messages: z.array(z.object({ role: z.string(), content: z.string() })),
+      model: z.string().default('llama-3.3-70b-versatile'),
+      max_tokens: z.number().int().positive().max(500).default(150),
+      temperature: z.number().min(0).max(2).default(0.8),
+      stream: z.boolean().default(true),
+    }).parse(request.body);
+
+    const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'authorization': `Bearer ${config.GROQ_API_KEY}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!groqResponse.ok) {
+      const text = await groqResponse.text();
+      reply.status(groqResponse.status).send({ error: 'groq_error', message: text });
+      return;
+    }
+
+    reply.raw.writeHead(groqResponse.status, {
+      'content-type': groqResponse.headers.get('content-type') ?? 'text/event-stream',
+      'cache-control': 'no-cache',
+      'transfer-encoding': 'chunked',
+    });
+
+    const reader = groqResponse.body?.getReader();
+    if (!reader) {
+      reply.raw.end();
+      return;
+    }
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        reply.raw.write(value);
+      }
+    } finally {
+      reply.raw.end();
+    }
+  });
 
   app.post('/sessions', async (request, reply) => {
     const body = sessionCreateSchema.parse(request.body);
